@@ -120,13 +120,24 @@ void handleSampling(JsonVariantConst id) {
   Measurement m;
   measure(&m);
 
+  if (m.valid_count == 0) {
+    sendError(&id, "echo_timeout");  // whole sensor not responding
+    return;
+  }
+
   JsonDocument doc;
   beginResponse(doc, id);
   doc["status"] = "ok";
   doc["unit"] = "cm";
+  doc["n"] = SAMPLE_COUNT;
+  doc["n_valid"] = m.valid_count;
   JsonArray samples = doc["samples"].to<JsonArray>();
   for (int i = 0; i < SAMPLE_COUNT; i++) {
-    samples.add(m.samples[i]);
+    if (m.samples[i] == 0.0f) {
+      samples.add(nullptr);  // timed-out ping -> null, not an ambiguous 0.0
+    } else {
+      samples.add(m.samples[i]);
+    }
   }
   sendResponse(doc);
 }

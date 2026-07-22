@@ -64,7 +64,7 @@ All responses carry `"type":"resp"`, the echoed `id`, and a `status` of `"ok"` o
 | Command / case | Example response |
 |----------------|------------------|
 | `read_puit` ok | `{"id":42,"type":"resp","status":"ok","value":123.4,"unit":"cm","n":10,"n_valid":9}` |
-| `sampling` ok  | `{"id":42,"type":"resp","status":"ok","unit":"cm","samples":[123.4,124.0, …]}` |
+| `sampling` ok  | `{"id":42,"type":"resp","status":"ok","unit":"cm","n":10,"n_valid":9,"samples":[123.4,null,124.0, …]}` |
 | `status` ok    | `{"id":42,"type":"resp","status":"ok","fw":"1.1.0","proto":1,"uptime_ms":12345}` |
 | sensor failure | `{"id":42,"type":"resp","status":"error","code":"echo_timeout"}` |
 | unknown `cmd`  | `{"id":42,"type":"resp","status":"error","code":"unknown_cmd"}` |
@@ -74,6 +74,11 @@ All responses carry `"type":"resp"`, the echoed `id`, and a `status` of `"ok"` o
 pings that returned an echo. If *no* ping echoes back, it returns `echo_timeout` instead of a
 bogus value. `bad_request` is emitted when the line is not valid JSON or has no known `cmd`
 (the `id` is `null` because it could not be read).
+
+`sampling` returns the raw per-ping distances for diagnostics. A ping that timed out (no echo)
+appears as `null` in the `samples` array — never a misleading `0` — and `n_valid` reports how
+many of the `n` pings echoed back. Like `read_puit`, if *no* ping echoes back it returns
+`echo_timeout` rather than an all-`null` array.
 
 - **Units / conversion:** this firmware reports **raw distance in cm only**. The
   distance→volume conversion (`volume_m3 = (220 - cm) * 0.04`) lives entirely on the Pi side
@@ -123,9 +128,11 @@ force it into bootloader mode, then upload again immediately.
    `{"type":"ready","proto":1,"fw":"1.1.0"}`.
 2. Send `{"id":1,"cmd":"status"}` → expect an `ok` response with `fw`/`proto`/`uptime_ms` and `"id":1`.
 3. Send `{"id":2,"cmd":"read_puit"}` → expect an `ok` response with a numeric `value` in cm.
-4. Send `{"id":3,"cmd":"sampling"}` → expect an `ok` response with a `samples` array.
+4. Send `{"id":3,"cmd":"sampling"}` → expect an `ok` response with a `samples` array plus
+   `n`/`n_valid`; failed pings show as `null`.
 5. Send garbage (e.g. `hello`) → expect `{"id":null,...,"code":"bad_request"}`; aim the sensor
-   at open air → expect `read_puit` to return `code":"echo_timeout"` rather than `0`.
+   at open air (or unplug the echo wire) → expect both `read_puit` and `sampling` to return
+   `code":"echo_timeout"` rather than a bogus reading.
 6. Back on the Pi, once `read_puit.py` is updated to the NDJSON protocol, run `/mesure`
    (Telegram) or wait for `sensors.service` — it should record a value, confirming end-to-end
    compatibility.
