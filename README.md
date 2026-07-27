@@ -40,65 +40,202 @@ the Pi can correlate replies and ignore stray lines; sensor failures are reporte
 
 - **Transport:** USB CDC serial, **9600 baud** (nominal on native USB — data moves at USB
   speed regardless). Enumerates as `/dev/ttyACM0` on the Pi.
-- **Protocol version:** `proto = 1`.
+- **Protocol version:** `proto = 2`. Every line the board emits carries `proto`, so the Pi can
+  identify what it is talking to from any reply, not just the banner.
 - **Boot banner:** on reset the board prints one line and nothing else until commanded:
   ```json
-  {"type":"ready","proto":1,"fw":"1.1.0"}
+  {"type":"ready","proto":2,"fw":"2.0.0"}
   ```
   The Pi resets the board (DTR toggle) and waits for a line that parses to JSON with
   `type == "ready"` before issuing commands.
+- **Stateless:** the board keeps nothing between requests. Anything a request does not specify
+  falls back to the documented default, and every response echoes the values actually used.
+  Nothing to re-send after a reset, nothing to drift out of sync.
 
 ### Requests (Pi → board)
 
 ```json
-{"id":<int>,"cmd":"<name>"}
+{"id":<int>,"cmd":"<name>", <optional parameters…>}
 ```
 
-- `id` — a request counter chosen by the Pi; echoed back verbatim in the response.
+- `id` — a request counter chosen by the Pi, **required and must be an integer**; echoed back
+  verbatim. A missing or mistyped `id` is `bad_id`.
 - `cmd` — one of `read_puit`, `sampling`, `status`.
+
+#### Measurement parameters
+
+Optional on `read_puit` and `sampling`; ignored by `status`. Absent — or explicitly `null` — means
+"use the default".
+
+| Field        | Type  | Default          | Accepted range | Notes |
+|--------------|-------|------------------|----------------|-------|
+| `n`          | int   | `10`             | 1 – 25         | pings per burst |
+| `timeout_us` | int   | `30000`          | 2000 – 60000   | per-ping echo timeout; also caps reachable distance (~515 cm at the default) |
+| `temp_c`     | float | `20.0`           | −20 – 60       | assumed air temperature; drives the µs→cm divisor |
+| `min_cm`     | float | `5.0`            | 0 – 1030       | lower edge of the plausibility window |
+| `max_cm`     | float | `500.0`          | 0 – 1030       | upper edge; additionally capped to what `timeout_us` can reach |
+| `min_valid`  | int   | ceil(50% of `n`) | 0 – `n`        | valid pings required for a reading; `0` disables the gate |
+
+Two distinct behaviours, deliberately:
+
+- **Wrong type** → `bad_param`, with `field` naming the offender. `{"n":"ten"}` is an error.
+- **Out of range** → **silently clamped**. `{"n":999}` measures 25 pings. This is safe because
+  every response echoes the *effective* value, so the clamp is visible rather than hidden.
+
+`max_cm` is capped to `timeout_us / divisor` before use, so raising `max_cm` without also raising
+`timeout_us` is a visible no-op rather than a silent one. If the window ends up empty —
+`min_cm >= max_cm`, whether because the request inverted the bounds or because the timeout cannot
+reach `min_cm` — that is `bad_param` with `field: "min_cm"`, since it would reject every ping.
+
+### What counts as a valid ping
+
+**This changed in `proto 2` and it changes what the Grafana data means.** In `proto 1`, `n_valid`
+counted any ping that returned an echo, with no check on the value. That made it blind to the most
+dangerous failure mode: a 200 µs echo (≈3.4 cm) is inside the HC-SR04's blind zone, and echoes off
+the shaft wall or the mounting bracket are *consistent* — so a misaimed sensor reported
+`n_valid: 10`, a tiny spread and `status: "ok"`, i.e. maximum apparent confidence on a completely
+wrong number. A sensor that has gone **silent** is easy to notice; one that is confidently **wrong**
+quietly poisons the time series.
+
+In `proto 2` a ping is valid only if it echoed **and** the distance it implies is plausible:
+
+| Field        | Meaning |
+|--------------|---------|
+| `n`          | pings fired |
+| `n_timeout`  | no echo at all — `pulseIn` timed out |
+| `n_rejected` | echoed, but outside `[min_cm, max_cm]` |
+| `n_valid`    | echoed and inside the window — the **only** pings feeding `value`/`min`/`max`/`spread` |
+
+`n == n_valid + n_timeout + n_rejected` always holds, and all four are reported on **every**
+measurement response, success or failure. This buys a diagnosis that was impossible before:
+`n_rejected: 10` means *the sensor is alive and aimed at the wrong thing*.
+
+The default window (5–500 cm) rejects only the physically impossible — the blind zone below, the
+sensor's reach above — without assuming anything about the well. Narrow it via `min_cm`/`max_cm`
+once the real geometry is trusted.
 
 ### Responses (board → Pi)
 
-All responses carry `"type":"resp"`, the echoed `id`, and a `status` of `"ok"` or `"error"`.
+All responses carry `"type":"resp"`, `"proto":2`, the echoed `id`, and a `status` of `"ok"` or
+`"error"`.
 
-| Command / case | Example response |
-|----------------|------------------|
-| `read_puit` ok | `{"id":42,"type":"resp","status":"ok","value":123.4,"unit":"cm","n":10,"n_valid":9}` |
-| `sampling` ok  | `{"id":42,"type":"resp","status":"ok","unit":"cm","n":10,"n_valid":9,"samples":[123.4,null,124.0, …]}` |
-| `status` ok    | `{"id":42,"type":"resp","status":"ok","fw":"1.1.0","proto":1,"uptime_ms":12345}` |
-| sensor failure | `{"id":42,"type":"resp","status":"error","code":"echo_timeout"}` |
-| unknown `cmd`  | `{"id":42,"type":"resp","status":"error","code":"unknown_cmd"}` |
-| bad request    | `{"id":null,"type":"resp","status":"error","code":"bad_request"}` |
+`read_puit` — median distance in cm over the valid pings:
 
-`read_puit` returns the **median distance in cm** over `n` pings, computed over the `n_valid`
-pings that returned an echo. If *no* ping echoes back, it returns `echo_timeout` instead of a
-bogus value. `bad_request` is emitted when the line is not valid JSON or has no known `cmd`
-(the `id` is `null` because it could not be read).
+```json
+{"id":42,"type":"resp","proto":2,"status":"ok","value":123.4,"unit":"cm","pulse_us":7186,
+ "min":122.8,"max":124.1,"spread":1.3,
+ "n":10,"n_valid":9,"n_timeout":1,"n_rejected":0,
+ "temp_c":20,"min_cm":5,"max_cm":500,"timeout_us":30000,"min_valid":5}
+```
 
-`sampling` returns the raw per-ping distances for diagnostics. A ping that timed out (no echo)
-appears as `null` in the `samples` array — never a misleading `0` — and `n_valid` reports how
-many of the `n` pings echoed back. Like `read_puit`, if *no* ping echoes back it returns
-`echo_timeout` rather than an all-`null` array.
+`sampling` — the same, plus per-ping detail for diagnostics:
+
+```json
+{"id":43,"type":"resp","proto":2,"status":"ok","value":123.4,"unit":"cm",
+ "min":122.8,"max":124.1,"spread":1.3,
+ "n":10,"n_valid":9,"n_timeout":1,"n_rejected":0,
+ "temp_c":20,"min_cm":5,"max_cm":500,"timeout_us":30000,"min_valid":5,
+ "samples":[123.4,null,124.0,…],"pulse_us":[7186,null,7221,…]}
+```
+
+In the arrays, `null` marks a **timeout only**. A ping that echoed but fell outside the window keeps
+its cm and µs values — raw truth is never discarded, only excluded from the statistics — and the Pi
+can re-classify any entry itself against the echoed `min_cm`/`max_cm`. The two arrays are index-
+aligned with each other.
+
+`status` — identity plus limits, so the Pi can discover them instead of keeping a second copy of
+these constants:
+
+```json
+{"id":44,"type":"resp","proto":2,"status":"ok","fw":"2.0.0","uptime_ms":12345,
+ "max_n":25,"n_default":10,"timeout_default_us":30000,
+ "min_cm_default":5,"max_cm_default":500,"line_max":192}
+```
+
+#### Error codes
+
+```json
+{"id":42,"type":"resp","proto":2,"status":"error","code":"out_of_range", …}
+```
+
+| `code` | Meaning | `id` |
+|--------|---------|------|
+| `bad_request` | the line is not parseable JSON | `null` |
+| `line_too_long` | request exceeded `line_max` (192) bytes | `null` |
+| `bad_id` | `id` missing or not an integer | `null` |
+| `unknown_cmd` | parsed fine, but `cmd` is unrecognised or absent | echoed |
+| `bad_param` | a parameter has the wrong type, or the window is empty; carries `field` | echoed |
+| `echo_timeout` | no valid pings, predominantly **no echo** — sensor silent or aimed at open air | echoed |
+| `out_of_range` | no valid pings, predominantly **outside the window** — sensor alive, misaimed | echoed |
+| `insufficient_samples` | `0 < n_valid < min_valid` — some echoes, too few to trust | echoed |
+
+The three `"id":null` cases are told apart by their `code`, never by the `id`. The four measurement
+errors all carry the counts and the effective parameters, so a single logged line explains itself.
 
 - **Units / conversion:** this firmware reports **raw distance in cm only**. The
   distance→volume conversion (`volume_m3 = (220 - cm) * 0.04`) lives entirely on the Pi side
   and in the Grafana dashboards — it is *not* part of this contract.
-- **Accuracy note:** the `/58` divisor in the sketch assumes ~20 °C (speed of sound ≈ 343 m/s).
-  A more precise, temperature-compensated formula is sketched in the source comments for future
-  work (would require a temperature sensor).
+- **Accuracy / conversion:** the pulse covers the round trip, so
+  `divisor = 2 × 1e6 / (v × 100) = 20000 / v` with `v = 331.4 + 0.6·T` m/s. At 20 °C that is
+  **58.24**, matching the `/58` constant used through `proto 1`. Temperature is worth ~0.17%/°C —
+  about **4 cm across a 10→30 °C swing** at 220 cm — which is why `temp_c` is a request parameter
+  even with no temperature sensor fitted: the Pi can supply it from any source it already has.
+  ⚠️ The temperature-compensated formula previously sketched in the source comments as future work
+  was **4× too small** (`1e6/(v*100)/2` → 14.56 at 20 °C). It was never used; the corrected form
+  above is now `cmDivisorFor()` in the sketch.
+
+### Why `pulse_us` is in every response
+
+`pulse_us` is the raw echo width — the only quantity the board actually measures, and the one thing
+that is temperature-independent. `value` is derived from it via the divisor above.
+
+**Store both.** The 4×-wrong formula noted above is exactly the class of bug that silently corrupts
+a time series: with only cm in InfluxDB, a formula fix cannot be applied to history. With `pulse_us`
+and the assumed `temp_c` alongside it, any future correction can be replayed retroactively over
+everything already recorded, for the cost of two extra fields per point.
+
+For `read_puit`, `pulse_us` is the median pulse of the valid pings — the exact raw counterpart of
+`value`, since `cm = pulse / divisor` is monotonic.
+
+### Future: environment sensing
+
+Not implemented — recorded here so the intent survives. Once a temperature/humidity sensor is fitted
+at the well head (I²C on D4/D5; **not** a DHT22, whose ~2 s read would dominate a measurement burst):
+
+- The board reads it **inline, once per burst** — not on a timer. The temperature that matters is the
+  one in the air column at ping time, and a cached value reintroduces the very error the sensor is
+  there to remove.
+- The board returns `value` **only** when it has a real reading for every input. If the environment
+  read is missing or fails, it omits `value`, returns `pulse_us` plus whatever it does have, and the
+  Pi derives the distance from its own last-known-good temperature. The board must never fabricate a
+  distance from a guessed temperature.
+- This does not bite today: with no sensor fitted nothing can go *missing*, so 20 °C is a fixed,
+  documented assumption and `value` is always present.
+
+Because `pulse_us` is already in the contract, fitting the sensor should be a firmware-only,
+additive change — no `proto 3`.
 
 ### Required Pi-side (`read_puit.py`) changes
 
-This NDJSON protocol is a **breaking change** from the previous line-based text protocol.
-`read_puit.py` must be updated to match:
+`proto 2` is a **breaking change**. `read_puit.py` must be updated:
 
-- In `open_arduino()`, wait for a line that `json.loads` to `type == "ready"` (optionally
-  assert `proto == 1`) instead of the literal string `Started serial com`.
-- Send `json.dumps({"id": n, "cmd": "read_puit"}) + "\n"` with an incrementing `n`.
-- Replace the fixed `sleep(0.5)` / 12 s waits with: read lines until one parses to JSON with a
-  matching `id` and `type == "resp"` (bounded by the serial read timeout / an overall
-  deadline). On `status == "error"`, surface the `code`; on `ok`, read `value`. The existing
-  retry loop and file lock can stay unchanged.
+- In `open_arduino()`, wait for a line that `json.loads` to `type == "ready"` and assert
+  `proto == 2`.
+- Send `json.dumps({"id": n, "cmd": "read_puit"}) + "\n"` with an **incrementing integer** `n` —
+  a missing or non-integer `id` is now rejected with `bad_id`.
+- Read lines until one parses to JSON with a matching `id` and `type == "resp"` (bounded by the
+  serial read timeout / an overall deadline). On `status == "ok"`, read `value`. The existing retry
+  loop and file lock can stay unchanged.
+- **Treat the error codes differently** — this is the point of having distinct codes:
+  - `insufficient_samples`, `echo_timeout` → **retry** (transient: waves, a passing obstruction).
+  - `out_of_range` → **alert, do not retry**. The sensor is working and pointed at the wrong thing;
+    retrying never fixes it. This wants a Telegram notification, not a silent retry.
+  - `bad_id`, `bad_param`, `bad_request`, `line_too_long` → **bug on the Pi side**; log loudly and
+    do not retry, the request will never succeed as sent.
+- **Record more than cm.** Store `pulse_us`, `temp_c`, and `n_valid`/`n_timeout`/`n_rejected` as
+  InfluxDB fields next to the distance, so formula fixes can be replayed over history and a slowly
+  misaiming sensor becomes visible as a graph instead of a surprise.
+- Optionally send `temp_c` from any temperature source the Pi already has.
 
 ## Build & flash (PlatformIO in VSCode)
 
@@ -124,15 +261,38 @@ force it into bootloader mode, then upload again immediately.
 
 ## Testing after a flash
 
-1. Open the serial monitor at 9600 baud and reset the board — you should see the ready banner
-   `{"type":"ready","proto":1,"fw":"1.1.0"}`.
-2. Send `{"id":1,"cmd":"status"}` → expect an `ok` response with `fw`/`proto`/`uptime_ms` and `"id":1`.
-3. Send `{"id":2,"cmd":"read_puit"}` → expect an `ok` response with a numeric `value` in cm.
-4. Send `{"id":3,"cmd":"sampling"}` → expect an `ok` response with a `samples` array plus
-   `n`/`n_valid`; failed pings show as `null`.
-5. Send garbage (e.g. `hello`) → expect `{"id":null,...,"code":"bad_request"}`; aim the sensor
-   at open air (or unplug the echo wire) → expect both `read_puit` and `sampling` to return
-   `code":"echo_timeout"` rather than a bogus reading.
-6. Back on the Pi, once `read_puit.py` is updated to the NDJSON protocol, run `/mesure`
-   (Telegram) or wait for `sensors.service` — it should record a value, confirming end-to-end
-   compatibility.
+Open the serial monitor at 9600 baud and reset the board.
+
+1. **Banner** → `{"type":"ready","proto":2,"fw":"2.0.0"}`.
+2. `{"id":1,"cmd":"status"}` → `ok` with `fw`/`uptime_ms` and the limits
+   (`max_n:25`, `n_default:10`, `line_max:192`).
+3. `{"id":2,"cmd":"read_puit"}` → `ok` with a numeric `value` in cm, the four counts summing to `n`,
+   and `min`/`max`/`spread`. **Check `value ≈ pulse_us / 58.24` by hand** — that is the regression
+   guard for the divisor. Against a tape-measured target the reading should be **unchanged from
+   fw 1.1.0**; if it moved, the rewrite shifted the calibration.
+4. **Parameters:** `{"id":3,"cmd":"sampling","n":25,"temp_c":8.5}` → 25-entry `samples` *and*
+   `pulse_us`, `null`s aligned, echoing `n:25`/`temp_c:8.5`. Against a fixed target the cm values
+   read *shorter* than at `temp_c:20` (colder air, slower sound) while `pulse_us` is **unchanged** —
+   that is what makes retroactive recomputation from `pulse_us` valid.
+   - `{"id":4,"cmd":"read_puit","n":999}` → clamped, echoes `n:25`.
+   - `{"id":5,"cmd":"read_puit","n":"ten"}` → `bad_param`, `"field":"n"`.
+   - `{"id":6,"cmd":"read_puit","min_cm":100,"max_cm":50}` → `bad_param`, `"field":"min_cm"`.
+   - `{"id":7,"cmd":"read_puit","max_cm":900}` → echoes `max_cm` capped near 515 (timeout-limited).
+5. **Plausibility window — the important one.** Hold a target ~3 cm from the sensor, inside the
+   blind zone: expect `out_of_range` with `n_rejected ≈ n` and `n_timeout: 0`. *On fw 1.1.0 the same
+   shot returns `status:"ok"` with a ~3 cm value* — worth reproducing on the old firmware first,
+   since it is the whole reason this changed. Then `{"id":8,"cmd":"read_puit","min_cm":1}` on the
+   same shot → `ok`, confirming it was the window that rejected it.
+6. **Gate:** aim so only a few pings return (oblique or partly obstructed surface) →
+   `insufficient_samples` with `0 < n_valid < min_valid`. Resend with `"min_valid":0` → the same shot
+   returns `ok`. Unplug the echo wire → `echo_timeout` with `n_timeout: n`, `n_rejected: 0` — check
+   it is *not* reported as `out_of_range`.
+7. **Errors:** send `hello` → `bad_request` with `"id":null`. Send `{"cmd":"status"}` → `bad_id`.
+   Send `{"id":9,"cmd":"nope"}` → `unknown_cmd` with `"id":9`. Paste a line longer than 192
+   characters → `line_too_long`, then confirm the **next** valid request still answers — that proves
+   the reader recovers by draining to the newline.
+8. **Reader:** send two requests back-to-back with no delay → two correlated responses, no lost
+   line. Send an empty line → no reply at all. A `read_puit` should return promptly, with no 200 ms
+   idle penalty and no 1 s timeout stall.
+9. Back on the Pi, once `read_puit.py` is updated for `proto 2`, run `/mesure` (Telegram) or wait
+   for `sensors.service` — it should record a value, confirming end-to-end compatibility.
