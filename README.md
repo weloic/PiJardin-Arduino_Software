@@ -209,9 +209,104 @@ these constants:
 The three `"id":null` cases are told apart by their `code`, never by the `id`. The four measurement
 errors all carry the counts and the effective parameters, so a single logged line explains itself.
 
-Those four are all "no usable reading", but they mean different things and want different reactions —
-see the Pi-side section. In particular `sensor_fault` and `out_of_range` are *physical* problems that
-retrying will never fix, whereas `echo_timeout` and `insufficient_samples` are often transient.
+### Telling outcomes apart — how to log this properly
+
+Everything needed to classify a reply is in the reply itself. There are **three levels of detail**,
+and which one you need depends on what you are logging.
+
+**Level 1 — `status` + `code`: the verdict on the whole burst.** This answers "do I have a usable
+reading, and if not, whose fault is it." Nine codes, listed above. Note what this level does *not*
+tell you: a `status:"ok"` reply may still have had failed pings.
+
+**Level 2 — the four counts: which physical outcome dominated.** Present on **every** measurement
+reply, success *and* failure. This is the level to record in InfluxDB, because it distinguishes the
+failure *modes* rather than just success/failure:
+
+| Count | A healthy sensor | Non-zero means |
+|-------|------------------|----------------|
+| `n_valid` | `== n` | — |
+| `n_timeout` | occasionally 1–2 | sensor answered, no echo: ripples, oblique surface, absorbent water |
+| `n_rejected` | `0` | echo outside the window: misaim, bracket, blind zone, or the ~652 cm "nothing found" artefact |
+| `n_no_response` | **always 0** | sensor ignored the trigger: **hardware** — power, wiring, dying module |
+
+The asymmetry matters when choosing log levels: `n_timeout` has benign causes, **`n_no_response`
+does not**. Any non-zero `n_no_response`, even on an otherwise perfect `ok` reading, is worth a
+warning — it is the earliest signal of a failing connection, and no `min_valid` threshold will
+surface it because the burst still succeeds.
+
+**Level 3 — `ping_status`: which ping, in what pattern.** One character per ping, `sampling` only:
+
+| Char | Outcome | `samples[i]` / `pulse_us[i]` |
+|------|---------|------------------------------|
+| `V` | valid | the values |
+| `R` | rejected — echoed, outside the window | the values (kept deliberately) |
+| `T` | timeout — answered, no echo | `null` |
+| `N` | no response — trigger ignored | `null` |
+
+`V` vs `R` can also be derived by comparing `samples[i]` against the echoed `min_cm`/`max_cm`. **`T`
+vs `N` cannot** — both are `null` in both arrays, so `ping_status` is the only per-ping way to
+separate a blind sensor from a non-responding one. That is why it exists.
+
+The *pattern* is itself diagnostic: `VVTVVVTVVV` (scattered) reads as surface noise, while
+`VVVVVNNNNN` (clustered) reads as a sensor dropping out mid-burst — an intermittent connection.
+
+#### Decision table
+
+| Reply | Additional condition | Interpretation | Log level | Action |
+|-------|---------------------|----------------|-----------|--------|
+| `ok` | `n_valid == n` | clean measurement | debug | store |
+| `ok` | `n_valid < n`, `n_no_response == 0` | usable; some pings lost to the environment | info | store, record counts |
+| `ok` | `n_no_response > 0` | usable, but the sensor missed a trigger | **warning** | store; alert if it recurs |
+| `error` | `insufficient_samples` | too few valid pings to trust | warning | **retry** |
+| `error` | `echo_timeout` | sensor answers, finds nothing | warning | **retry** |
+| `error` | `out_of_range` | sensor alive but misaimed / obstructed | **error** | **alert, do not retry** |
+| `error` | `sensor_fault` | sensor not responding at all | **critical** | **alert, do not retry** |
+| `error` | `bad_id`, `bad_param`, `bad_request`, `line_too_long`, `unknown_cmd` | bug in the Pi-side request | **error** | fix the code; retrying cannot help |
+
+Retrying only ever helps the two transient rows. `out_of_range` and `sensor_fault` are physical
+problems: something has to be looked at or moved.
+
+> **Known limitation affecting `n_no_response`.** The firmware currently waits only `delay(3)`
+> between pings, while the HC-SR04 datasheet recommends a ≥60 ms measurement cycle. A trigger
+> arriving while the module is still busy may be ignored, producing an `N` that is a *timing*
+> artefact rather than a wiring fault. Until that gap is raised, treat an isolated `N` as worth
+> investigating rather than as proof of a hardware failure; a burst that is mostly or entirely `N`
+> is unambiguous either way.
+
+#### Sketch of the Pi-side dispatch
+
+```python
+resp = read_response(ser, req_id)          # matching id, type == "resp"
+
+if resp["status"] == "ok":
+    if resp["n_no_response"]:              # no benign cause -- see above
+        log.warning("puit: %d trigger(s) ignored (%s)",
+                    resp["n_no_response"], resp.get("ping_status", "-"))
+    elif resp["n_valid"] < resp["n"]:
+        log.info("puit: %d/%d pings lost", resp["n_valid"], resp["n"])
+    store(cm=resp["value"], pulse_us=resp["pulse_us"], temp_c=resp["temp_c"],
+          n_valid=resp["n_valid"], n_timeout=resp["n_timeout"],
+          n_rejected=resp["n_rejected"], n_no_response=resp["n_no_response"])
+    return resp["value"]
+
+code = resp["code"]
+if code in ("insufficient_samples", "echo_timeout"):
+    log.warning("puit: %s (%s)", code, counts(resp))
+    raise Retryable(code)
+if code in ("sensor_fault", "out_of_range"):
+    log.error("puit: %s (%s) -- needs physical attention", code, counts(resp))
+    notify_telegram(code, resp)            # deliberately not retried
+    raise Permanent(code)
+log.error("puit: protocol bug -- %s %s", code, resp.get("field", ""))
+raise Permanent(code)
+```
+
+Note `resp.get(...)` throughout: `value`, `min`, `max`, `spread` and `pulse_us` are **absent** on
+every error reply, and `ping_status` exists only on a successful `sampling`. The counts and the
+effective parameters are the only measurement fields guaranteed on both.
+
+When something needs investigating, re-issue the same burst as `sampling` — identical parameters,
+plus the per-ping arrays and `ping_status`.
 
 - **Units / conversion:** this firmware reports **raw distance in cm only**. The
   distance→volume conversion (`volume_m3 = (220 - cm) * 0.04`) lives entirely on the Pi side
@@ -267,15 +362,11 @@ additive change — no `proto 3`.
 - Read lines until one parses to JSON with a matching `id` and `type == "resp"` (bounded by the
   serial read timeout / an overall deadline). On `status == "ok"`, read `value`. The existing retry
   loop and file lock can stay unchanged.
-- **Treat the error codes differently** — this is the point of having distinct codes:
-  - `insufficient_samples`, `echo_timeout` → **retry** (transient: waves, a passing obstruction).
-  - `sensor_fault` → **alert immediately, do not retry**. The sensor is not responding to the
-    trigger at all: no power, a dead module, or a disconnected wire. Someone has to go and look at
-    it. This is the loudest thing the board can tell you and deserves a Telegram notification.
-  - `out_of_range` → **alert, do not retry**. The sensor is working and pointed at the wrong thing;
-    retrying never fixes it.
-  - `bad_id`, `bad_param`, `bad_request`, `line_too_long` → **bug on the Pi side**; log loudly and
-    do not retry, the request will never succeed as sent.
+- **Treat the error codes differently** — the whole point of having distinct codes. The decision
+  table, log levels and a dispatch sketch are in
+  [Telling outcomes apart](#telling-outcomes-apart--how-to-log-this-properly); in short, retry only
+  `insufficient_samples` and `echo_timeout`, alert without retrying on `sensor_fault` and
+  `out_of_range`, and treat every remaining code as a Pi-side bug.
 - **Record more than cm.** Store `pulse_us`, `temp_c`, and all four counts
   (`n_valid`/`n_timeout`/`n_rejected`/`n_no_response`) as InfluxDB fields next to the distance, so
   formula fixes can be replayed over history and a degrading sensor becomes visible as a graph
