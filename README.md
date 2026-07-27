@@ -70,7 +70,7 @@ Optional on `read_puit` and `sampling`; ignored by `status`. Absent — or expli
 | Field        | Type  | Default          | Accepted range | Notes |
 |--------------|-------|------------------|----------------|-------|
 | `n`          | int   | `10`             | 1 – 25         | pings per burst |
-| `timeout_us` | int   | `30000`          | 2000 – 60000   | per-ping echo timeout; also caps reachable distance (~515 cm at the default) |
+| `timeout_us` | int   | `45000`          | 2000 – 60000   | per-ping echo timeout; also caps reachable distance (~772 cm at the default). Deliberately above the sensor's ~38 ms "nothing found" pulse — see below |
 | `temp_c`     | float | `20.0`           | −20 – 60       | assumed air temperature; drives the µs→cm divisor |
 | `min_cm`     | float | `5.0`            | 0 – 1030       | lower edge of the plausibility window |
 | `max_cm`     | float | `500.0`          | 0 – 1030       | upper edge; additionally capped to what `timeout_us` can reach |
@@ -97,22 +97,53 @@ the shaft wall or the mounting bracket are *consistent* — so a misaimed sensor
 wrong number. A sensor that has gone **silent** is easy to notice; one that is confidently **wrong**
 quietly poisons the time series.
 
-In `proto 2` a ping is valid only if it echoed **and** the distance it implies is plausible:
+In `proto 2` a ping is valid only if the sensor answered, an echo came back, **and** the distance it
+implies is plausible. Every ping lands in exactly one of four buckets:
 
-| Field        | Meaning |
-|--------------|---------|
-| `n`          | pings fired |
-| `n_timeout`  | no echo at all — `pulseIn` timed out |
-| `n_rejected` | echoed, but outside `[min_cm, max_cm]` |
-| `n_valid`    | echoed and inside the window — the **only** pings feeding `value`/`min`/`max`/`spread` |
+| Field           | Meaning |
+|-----------------|---------|
+| `n`             | pings fired |
+| `n_no_response` | the sensor never reacted to the trigger — **hardware fault** |
+| `n_timeout`     | the sensor reacted normally, but no echo returned in time |
+| `n_rejected`    | an echo returned, but outside `[min_cm, max_cm]` |
+| `n_valid`       | echo inside the window — the **only** pings feeding `value`/`min`/`max`/`spread` |
 
-`n == n_valid + n_timeout + n_rejected` always holds, and all four are reported on **every**
-measurement response, success or failure. This buys a diagnosis that was impossible before:
-`n_rejected: 10` means *the sensor is alive and aimed at the wrong thing*.
+`n == n_valid + n_timeout + n_rejected + n_no_response` always holds, and all five are reported on
+**every** measurement response, success or failure. This buys diagnoses that were impossible before:
+`n_rejected: 10` means *the sensor is alive and aimed at the wrong thing*, while
+`n_no_response: 10` means *the sensor is not talking to us at all*.
 
 The default window (5–500 cm) rejects only the physically impossible — the blind zone below, the
 sensor's reach above — without assuming anything about the well. Narrow it via `min_cm`/`max_cm`
 once the real geometry is trusted.
+
+#### Why `n_no_response` is separate from `n_timeout`
+
+This is the distinction `proto 1` could not make, and it is the difference between "the sensor is
+broken" and "the sensor sees nothing."
+
+The board pulses **trigger** (D8); the sensor chirps and raises **echo** (D7), dropping it when the
+chirp returns. The width of that HIGH period is the distance. Three outcomes:
+
+```
+normal, water at 123 cm            sensor fine, nothing in range        sensor dead / wire off
+trigger  __|‾|_________             trigger  __|‾|_________              trigger  __|‾|_________
+echo     ____|‾‾‾|_____             echo     ____|‾‾‾‾‾‾‾‾‾|_            echo     ______________
+             └7.2ms┘                             └─ 38 ms ─┘                    (never rises)
+              → 123 cm                            → 652 cm                       → no response
+```
+
+`pulseIn()` reports **0** for both of the right-hand cases, which is why `proto 1` conflated them.
+`proto 2` handles it two ways at once:
+
+- The firmware waits ~2 ms for echo to **rise** after each trigger. The sensor raises it whether or
+  not it finds anything, so no rise at all is an unambiguous hardware fault → `n_no_response`.
+- `timeout_us` defaults to **45 ms**, past the sensor's ~38 ms "nothing found" pulse. So a
+  live-but-blind sensor produces a real ~652 cm reading (→ `n_rejected`, since it exceeds
+  `max_cm`) rather than a silent zero.
+
+Belt and braces: the first works on any module; the second means even a module with unusual timing
+still looks different from a dead one.
 
 ### Responses (board → Pi)
 
@@ -124,8 +155,8 @@ All responses carry `"type":"resp"`, `"proto":2`, the echoed `id`, and a `status
 ```json
 {"id":42,"type":"resp","proto":2,"status":"ok","value":123.4,"unit":"cm","pulse_us":7186,
  "min":122.8,"max":124.1,"spread":1.3,
- "n":10,"n_valid":9,"n_timeout":1,"n_rejected":0,
- "temp_c":20,"min_cm":5,"max_cm":500,"timeout_us":30000,"min_valid":5}
+ "n":10,"n_valid":9,"n_timeout":1,"n_rejected":0,"n_no_response":0,
+ "temp_c":20,"min_cm":5,"max_cm":500,"timeout_us":45000,"min_valid":5}
 ```
 
 `sampling` — the same, plus per-ping detail for diagnostics:
@@ -133,22 +164,27 @@ All responses carry `"type":"resp"`, `"proto":2`, the echoed `id`, and a `status
 ```json
 {"id":43,"type":"resp","proto":2,"status":"ok","value":123.4,"unit":"cm",
  "min":122.8,"max":124.1,"spread":1.3,
- "n":10,"n_valid":9,"n_timeout":1,"n_rejected":0,
- "temp_c":20,"min_cm":5,"max_cm":500,"timeout_us":30000,"min_valid":5,
- "samples":[123.4,null,124.0,…],"pulse_us":[7186,null,7221,…]}
+ "n":10,"n_valid":9,"n_timeout":1,"n_rejected":0,"n_no_response":0,
+ "temp_c":20,"min_cm":5,"max_cm":500,"timeout_us":45000,"min_valid":5,
+ "samples":[123.4,null,124.0,…],"pulse_us":[7186,null,7221,…],
+ "ping_status":"VTVVVVVVVV"}
 ```
 
-In the arrays, `null` marks a **timeout only**. A ping that echoed but fell outside the window keeps
-its cm and µs values — raw truth is never discarded, only excluded from the statistics — and the Pi
-can re-classify any entry itself against the echoed `min_cm`/`max_cm`. The two arrays are index-
-aligned with each other.
+In the arrays, `null` marks a ping that produced no pulse width at all — either no echo or no
+response. A ping that echoed but fell outside the window keeps its cm and µs values: raw truth is
+never discarded, only excluded from the statistics. The two arrays are index-aligned.
+
+`ping_status` gives one character per ping, in order — **V**alid, **R**ejected, **T**imeout,
+**N**o response. It disambiguates the two `null` cases, and the pattern itself is informative:
+scattered losses (`VVTVVVTVVV`) suggest surface noise, while clustered ones (`VVVVVNNNNN`) suggest
+intermittent contact or a sensor dropping out mid-burst.
 
 `status` — identity plus limits, so the Pi can discover them instead of keeping a second copy of
 these constants:
 
 ```json
 {"id":44,"type":"resp","proto":2,"status":"ok","fw":"2.0.0","uptime_ms":12345,
- "max_n":25,"n_default":10,"timeout_default_us":30000,
+ "max_n":25,"n_default":10,"timeout_default_us":45000,
  "min_cm_default":5,"max_cm_default":500,"line_max":192}
 ```
 
@@ -165,12 +201,17 @@ these constants:
 | `bad_id` | `id` missing or not an integer | `null` |
 | `unknown_cmd` | parsed fine, but `cmd` is unrecognised or absent | echoed |
 | `bad_param` | a parameter has the wrong type, or the window is empty; carries `field` | echoed |
-| `echo_timeout` | no valid pings, predominantly **no echo** — sensor silent or aimed at open air | echoed |
+| `sensor_fault` | no valid pings, predominantly **no response to the trigger** — unpowered, dead, or a wire off | echoed |
+| `echo_timeout` | no valid pings, predominantly **no echo** — sensor responds but finds nothing | echoed |
 | `out_of_range` | no valid pings, predominantly **outside the window** — sensor alive, misaimed | echoed |
 | `insufficient_samples` | `0 < n_valid < min_valid` — some echoes, too few to trust | echoed |
 
 The three `"id":null` cases are told apart by their `code`, never by the `id`. The four measurement
 errors all carry the counts and the effective parameters, so a single logged line explains itself.
+
+Those four are all "no usable reading", but they mean different things and want different reactions —
+see the Pi-side section. In particular `sensor_fault` and `out_of_range` are *physical* problems that
+retrying will never fix, whereas `echo_timeout` and `insufficient_samples` are often transient.
 
 - **Units / conversion:** this firmware reports **raw distance in cm only**. The
   distance→volume conversion (`volume_m3 = (220 - cm) * 0.04`) lives entirely on the Pi side
@@ -228,13 +269,23 @@ additive change — no `proto 3`.
   loop and file lock can stay unchanged.
 - **Treat the error codes differently** — this is the point of having distinct codes:
   - `insufficient_samples`, `echo_timeout` → **retry** (transient: waves, a passing obstruction).
+  - `sensor_fault` → **alert immediately, do not retry**. The sensor is not responding to the
+    trigger at all: no power, a dead module, or a disconnected wire. Someone has to go and look at
+    it. This is the loudest thing the board can tell you and deserves a Telegram notification.
   - `out_of_range` → **alert, do not retry**. The sensor is working and pointed at the wrong thing;
-    retrying never fixes it. This wants a Telegram notification, not a silent retry.
+    retrying never fixes it.
   - `bad_id`, `bad_param`, `bad_request`, `line_too_long` → **bug on the Pi side**; log loudly and
     do not retry, the request will never succeed as sent.
-- **Record more than cm.** Store `pulse_us`, `temp_c`, and `n_valid`/`n_timeout`/`n_rejected` as
-  InfluxDB fields next to the distance, so formula fixes can be replayed over history and a slowly
-  misaiming sensor becomes visible as a graph instead of a surprise.
+- **Record more than cm.** Store `pulse_us`, `temp_c`, and all four counts
+  (`n_valid`/`n_timeout`/`n_rejected`/`n_no_response`) as InfluxDB fields next to the distance, so
+  formula fixes can be replayed over history and a degrading sensor becomes visible as a graph
+  instead of a surprise. Graphing `n_valid / n` is the single most useful health signal: a sensor on
+  its way out trends downward for weeks before it fails outright, which no single-burst threshold
+  can tell you.
+- **A single lost ping is not an error.** Occasional timeouts over water are normal, and the median
+  over the survivors is still sound. If you want to *log* imperfect bursts without losing the
+  reading, check `n_valid < n` on a successful response — the counts are there precisely for that.
+  Use `min_valid` only if you genuinely want to discard such readings.
 - Optionally send `temp_c` from any temperature source the Pi already has.
 
 ## Build & flash (PlatformIO in VSCode)
@@ -277,7 +328,7 @@ Open the serial monitor at 9600 baud and reset the board.
    - `{"id":4,"cmd":"read_puit","n":999}` → clamped, echoes `n:25`.
    - `{"id":5,"cmd":"read_puit","n":"ten"}` → `bad_param`, `"field":"n"`.
    - `{"id":6,"cmd":"read_puit","min_cm":100,"max_cm":50}` → `bad_param`, `"field":"min_cm"`.
-   - `{"id":7,"cmd":"read_puit","max_cm":900}` → echoes `max_cm` capped near 515 (timeout-limited).
+   - `{"id":7,"cmd":"read_puit","max_cm":900}` → echoes `max_cm` capped near 772 (timeout-limited).
 5. **Plausibility window — the important one.** Hold a target ~3 cm from the sensor, inside the
    blind zone: expect `out_of_range` with `n_rejected ≈ n` and `n_timeout: 0`. *On fw 1.1.0 the same
    shot returns `status:"ok"` with a ~3 cm value* — worth reproducing on the old firmware first,
@@ -285,14 +336,25 @@ Open the serial monitor at 9600 baud and reset the board.
    same shot → `ok`, confirming it was the window that rejected it.
 6. **Gate:** aim so only a few pings return (oblique or partly obstructed surface) →
    `insufficient_samples` with `0 < n_valid < min_valid`. Resend with `"min_valid":0` → the same shot
-   returns `ok`. Unplug the echo wire → `echo_timeout` with `n_timeout: n`, `n_rejected: 0` — check
-   it is *not* reported as `out_of_range`.
-7. **Errors:** send `hello` → `bad_request` with `"id":null`. Send `{"cmd":"status"}` → `bad_id`.
+   returns `ok`.
+7. **Sensor fault detection** — the two failures `proto 1` could not separate:
+   - **Unplug the echo wire (D7)** → `sensor_fault` with `n_no_response: n`. Check it is *not*
+     `echo_timeout`; the whole point is that a disconnected sensor no longer looks like a sensor
+     seeing nothing.
+   - **Unplug the trigger wire (D8)** → also `sensor_fault`. The sensor never fires, so it never
+     raises echo.
+   - **Aim at open air / the sky** with everything connected → the sensor answers but finds nothing.
+     Expect `out_of_range` with `n_rejected: n` and `n_no_response: 0`, and `pulse_us` around
+     `38000` (≈652 cm, beyond `max_cm`). If instead you get `n_timeout: n`, your module does not emit
+     the 38 ms pulse — harmless, the rise detection still catches genuine faults, but note it.
+   - Run `sampling` in each case and read `ping_status`: `NNNNNNNNNN` for a fault, `RRRRRRRRRR` for
+     blind-but-alive.
+8. **Errors:** send `hello` → `bad_request` with `"id":null`. Send `{"cmd":"status"}` → `bad_id`.
    Send `{"id":9,"cmd":"nope"}` → `unknown_cmd` with `"id":9`. Paste a line longer than 192
    characters → `line_too_long`, then confirm the **next** valid request still answers — that proves
    the reader recovers by draining to the newline.
-8. **Reader:** send two requests back-to-back with no delay → two correlated responses, no lost
+9. **Reader:** send two requests back-to-back with no delay → two correlated responses, no lost
    line. Send an empty line → no reply at all. A `read_puit` should return promptly, with no 200 ms
    idle penalty and no 1 s timeout stall.
-9. Back on the Pi, once `read_puit.py` is updated for `proto 2`, run `/mesure` (Telegram) or wait
-   for `sensors.service` — it should record a value, confirming end-to-end compatibility.
+10. Back on the Pi, once `read_puit.py` is updated for `proto 2`, run `/mesure` (Telegram) or wait
+    for `sensors.service` — it should record a value, confirming end-to-end compatibility.

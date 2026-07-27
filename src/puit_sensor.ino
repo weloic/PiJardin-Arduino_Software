@@ -31,23 +31,42 @@
 // --- Defaults and safe bounds for the per-request parameters -----------------
 #define DEFAULT_N 10
 #define MAX_N 25                     // sizes the per-ping arrays below
-#define DEFAULT_TIMEOUT_US 30000UL   // ~5 m; a missing echo returns 0 fast
+// Deliberately longer than the ~38 ms "nothing found" pulse the HC-SR04 emits:
+// waiting past it means a live-but-blind sensor reports a real (if implausible)
+// ~652 cm reading instead of looking identical to a dead one. ~772 cm ceiling.
+#define DEFAULT_TIMEOUT_US 45000UL
 #define MIN_TIMEOUT_US 2000UL
 #define MAX_TIMEOUT_US 60000UL       // ~10 m
+// The sensor raises Echo a few hundred us after a valid trigger, whether or not
+// it will find anything. Nothing within this window means it never answered.
+#define ACK_TIMEOUT_US 2000UL
+// A ping abandoned early (small timeout_us) can leave Echo still high; wait this
+// long for it to settle before triggering again.
+#define SETTLE_TIMEOUT_US 40000UL
 #define DEFAULT_TEMP_C 20.0f         // equivalent to the historical /58 divisor
 #define MIN_TEMP_C -20.0f
 #define MAX_TEMP_C 60.0f
 #define DEFAULT_MIN_CM 5.0f          // HC-SR04 blind zone: below this is an artefact
-#define DEFAULT_MAX_CM 500.0f        // matches DEFAULT_TIMEOUT_US (~515 cm ceiling)
+// Well of interest is ~220 cm deep, so 500 cm is generous while still rejecting
+// the ~652 cm artefact of a "nothing found" pulse (see DEFAULT_TIMEOUT_US).
+#define DEFAULT_MAX_CM 500.0f
 #define ABS_MAX_CM 1030.0f           // what MAX_TIMEOUT_US physically allows
 #define DEFAULT_MIN_VALID_PCT 50     // gate: n_valid must reach 50% of n
 #define LINE_MAX 192                 // *request* line cap; responses are unbounded
 
-// How one ping turned out. A ping is only "valid" if an echo came back AND the
-// distance it implies is physically plausible -- an echo off the mounting
+// How one ping turned out.
+//
+// PING_NO_RESPONSE and PING_TIMEOUT are the two cases a plain pulseIn() cannot
+// tell apart, because both make it return 0: the sensor never reacting to the
+// trigger at all (dead, unpowered, broken wire) versus the sensor reacting
+// normally but finding nothing to reflect off. The first is a hardware fault,
+// the second is an ordinary measurement outcome -- so they are counted apart.
+//
+// PING_REJECTED exists because a ping is only "valid" if an echo came back AND
+// the distance it implies is physically plausible: an echo off the mounting
 // bracket or from inside the sensor's blind zone is consistent and would
 // otherwise pass as a high-confidence wrong answer.
-enum PingStatus : uint8_t { PING_OK, PING_TIMEOUT, PING_REJECTED };
+enum PingStatus : uint8_t { PING_OK, PING_TIMEOUT, PING_REJECTED, PING_NO_RESPONSE };
 
 // Parameters for one measurement burst, after defaults, clamping and validation.
 struct MeasureParams {
@@ -64,7 +83,8 @@ struct Measurement {
   unsigned long pulses[MAX_N];  // raw echo widths; 0 only when PING_TIMEOUT
   float samples[MAX_N];         // derived cm, parallel to pulses
   PingStatus status[MAX_N];
-  int n, n_valid, n_timeout, n_rejected;  // always: n == valid + timeout + rejected
+  // always: n == n_valid + n_timeout + n_rejected + n_no_response
+  int n, n_valid, n_timeout, n_rejected, n_no_response;
   unsigned long median_pulse;
   float median, min, max;       // over PING_OK samples only
 };
@@ -220,21 +240,38 @@ void handleSampling(JsonVariantConst id, JsonVariantConst req) {
   addStats(doc, &m);
   addContext(doc, &m, &p);
 
-  // Per-ping detail for diagnostics. null marks a timeout only -- a ping that
-  // echoed but fell outside the window keeps its numbers, because raw truth is
-  // never discarded, only excluded from the statistics. The Pi can re-classify
-  // any entry itself against the echoed min_cm / max_cm.
+  // Per-ping detail for diagnostics. null marks a ping that produced no width
+  // at all (no echo, or no response) -- a ping that echoed but fell outside the
+  // window keeps its numbers, because raw truth is never discarded, only
+  // excluded from the statistics.
   JsonArray samples = doc["samples"].to<JsonArray>();
   JsonArray pulses = doc["pulse_us"].to<JsonArray>();
   for (int i = 0; i < m.n; i++) {
-    if (m.status[i] == PING_TIMEOUT) {
-      samples.add(nullptr);
-      pulses.add(nullptr);
-    } else {
+    if (m.status[i] == PING_OK || m.status[i] == PING_REJECTED) {
       samples.add(m.samples[i]);
       pulses.add(m.pulses[i]);
+    } else {
+      samples.add(nullptr);
+      pulses.add(nullptr);
     }
   }
+
+  // One character per ping, in order: V)alid, R)ejected, T)imeout, N)o response.
+  // The two null cases above are indistinguishable in the arrays, and reading
+  // the pattern beats re-deriving it from min_cm/max_cm -- a glance shows
+  // whether losses are scattered (noise) or clustered (intermittent contact).
+  char pattern[MAX_N + 1];
+  for (int i = 0; i < m.n; i++) {
+    switch (m.status[i]) {
+      case PING_OK:       pattern[i] = 'V'; break;
+      case PING_REJECTED: pattern[i] = 'R'; break;
+      case PING_TIMEOUT:  pattern[i] = 'T'; break;
+      default:            pattern[i] = 'N'; break;
+    }
+  }
+  pattern[m.n] = '\0';
+  doc["ping_status"] = pattern;  // copied into the document, not referenced
+
   sendResponse(doc);
 }
 
@@ -353,6 +390,7 @@ void addContext(JsonDocument &doc, const Measurement *m, const MeasureParams *p)
   doc["n_valid"] = m->n_valid;
   doc["n_timeout"] = m->n_timeout;
   doc["n_rejected"] = m->n_rejected;
+  doc["n_no_response"] = m->n_no_response;
   doc["temp_c"] = p->temp_c;
   doc["min_cm"] = p->min_cm;
   doc["max_cm"] = p->max_cm;
@@ -370,12 +408,20 @@ bool gateMeasurement(JsonVariantConst id, const Measurement *m, const MeasurePar
   const char *code;
   if (m->n_valid > 0) {
     code = "insufficient_samples";  // some echoes, too few to trust
+  } else if (m->n_no_response > 0 && m->n_no_response >= m->n_timeout &&
+             m->n_no_response >= m->n_rejected) {
+    // The sensor never even acknowledged the trigger: not a measurement
+    // failure but a hardware one -- unpowered, dead, or a wire off. Retrying
+    // will not help, so this is deliberately its own code.
+    code = "sensor_fault";
   } else if (m->n_rejected > m->n_timeout) {
     // Sensor is alive and answering, but everything it sees is implausible:
     // typically aimed at the shaft wall or a bracket rather than the water.
     code = "out_of_range";
   } else {
-    code = "echo_timeout";  // nothing came back at all
+    // The sensor answered the trigger but no echo returned in time: aimed at
+    // open air, or a surface too absorbent or oblique to reflect.
+    code = "echo_timeout";
   }
 
   JsonDocument doc;
@@ -423,29 +469,74 @@ float cmDivisorFor(float temp_c) {
   return 20000.0f / v_m_s;
 }
 
-// Fire p->n pings and classify each one. Echo timeouts return 0 from pulseIn;
-// echoes outside [min_cm, max_cm] keep their value but are excluded from the
-// statistics. Both are counted separately so the Pi can tell a silent sensor
-// from a misaimed one.
+// Fire one ping and measure the echo width in microseconds.
+//
+// This replaces pulseIn() in order to separate two failures it reports
+// identically as 0: the sensor never answering the trigger, and the sensor
+// answering but finding nothing in range. *answered distinguishes them.
+//   *answered == false, returns 0  -> never reacted (hardware fault)
+//   *answered == true,  returns 0  -> reacted, no echo within timeout_us
+//   *answered == true,  returns >0 -> echo width in us
+//
+// Timing is a digitalRead poll rather than pulseIn's tuned assembly, so the
+// resolution is a couple of microseconds (~0.03 cm) instead of one -- far below
+// the sensor's own real-world accuracy.
+unsigned long ping(unsigned long timeout_us, bool *answered) {
+  *answered = false;
+
+  // Echo must be idle before triggering: a ping abandoned early (small
+  // timeout_us) can still be holding the line high, and measuring the tail of
+  // the previous pulse would look like a plausible reading. A line that never
+  // settles is itself a fault, reported as "never answered".
+  unsigned long t0 = micros();
+  while (digitalRead(ECHOPIN) == HIGH) {
+    if (micros() - t0 > SETTLE_TIMEOUT_US) return 0;
+  }
+
+  digitalWrite(TRIGPIN, LOW);  // Set the trigger pin to low for 2uS
+  delayMicroseconds(2);
+  digitalWrite(TRIGPIN, HIGH);  // Send a 10uS high to trigger ranging
+  delayMicroseconds(20);
+  digitalWrite(TRIGPIN, LOW);   // Send pin low again
+
+  // The sensor raises Echo shortly after a valid trigger even when it will find
+  // nothing, so no rise at all means it is not responding.
+  t0 = micros();
+  while (digitalRead(ECHOPIN) == LOW) {
+    if (micros() - t0 > ACK_TIMEOUT_US) return 0;
+  }
+  *answered = true;
+
+  // Echo is high: time how long it stays high.
+  unsigned long rise = micros();
+  while (digitalRead(ECHOPIN) == HIGH) {
+    if (micros() - rise > timeout_us) return 0;
+  }
+  unsigned long width = micros() - rise;
+  return (width == 0) ? 1 : width;  // never return 0 for a real echo
+}
+
+// Fire p->n pings and classify each one into the four PingStatus buckets, so
+// the Pi can tell a dead sensor from a blind one from a misaimed one. Echoes
+// outside [min_cm, max_cm] keep their value but are excluded from the statistics.
 void measure(Measurement *m, const MeasureParams *p) {
   const float divisor = cmDivisorFor(p->temp_c);
   m->n = p->n;
   m->n_valid = 0;
   m->n_timeout = 0;
   m->n_rejected = 0;
+  m->n_no_response = 0;
 
   for (int i = 0; i < p->n; i++) {
-    digitalWrite(TRIGPIN, LOW);  // Set the trigger pin to low for 2uS
-    delayMicroseconds(2);
-    digitalWrite(TRIGPIN, HIGH);  // Send a 10uS high to trigger ranging
-    delayMicroseconds(20);
-    digitalWrite(TRIGPIN, LOW);   // Send pin low again
-
-    // Read echo pulse width (us) with a bounded timeout, convert to cm.
-    unsigned long pulse = pulseIn(ECHOPIN, HIGH, p->timeout_us);
+    bool answered = false;
+    unsigned long pulse = ping(p->timeout_us, &answered);
     m->pulses[i] = pulse;
 
-    if (pulse == 0) {
+    if (!answered) {
+      m->samples[i] = 0.0f;
+      m->status[i] = PING_NO_RESPONSE;
+      m->n_no_response++;
+    } else if (pulse == 0) {
       m->samples[i] = 0.0f;
       m->status[i] = PING_TIMEOUT;
       m->n_timeout++;
