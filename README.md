@@ -396,10 +396,100 @@ You flash this by connecting the XIAO directly to your computer over USB.
    To build without uploading, use **✓ (Build)** or `pio run`.
 5. **Serial monitor** (to test): click the plug icon, or run `pio device monitor -b 9600`.
 
+### Making `pio` work in a terminal
+
+The VSCode extension installs PlatformIO Core into its own Python venv (`~\.platformio\penv\`)
+and **does not add it to your PATH**, so `pio` in a plain terminal fails with "command not
+found" even though Core is installed. Either open a terminal that has it — Command Palette →
+**PlatformIO: New Terminal** — or call it by full path:
+
+```powershell
+& "$env:USERPROFILE\.platformio\penv\Scripts\pio.exe" run
+```
+
+To get bare `pio` everywhere, add it to your user PATH once, then reopen the terminal:
+
+```powershell
+[Environment]::SetEnvironmentVariable("PATH", [Environment]::GetEnvironmentVariable("PATH","User") + ";$env:USERPROFILE\.platformio\penv\Scripts", "User")
+```
+
+Every `pio …` command below assumes one of these is in place.
+
 ### Troubleshooting upload
 
 If the upload can't find the board / bootloader, **double-tap the reset pad** on the XIAO to
 force it into bootloader mode, then upload again immediately.
+
+## Standalone firmware image (flashing without PlatformIO)
+
+PlatformIO is only needed to *compile*. The build produces a plain firmware image you can carry
+to any machine and flash there — useful to hand the firmware to someone who has no toolchain
+installed, or to keep a known-good image alongside a release.
+
+### 1. Build the image
+
+```
+pio run
+```
+
+(or the **✓ (Build)** button). Artifacts land in `.pio/build/seeed_xiao/`:
+
+| File | What it is |
+| --- | --- |
+| `firmware.bin` | raw image, **linked for load address `0x2000`** |
+| `firmware.elf` | same code with symbols, for debugging |
+
+`0x2000` is the XIAO's application start: the bootloader owns `0x0000`–`0x1FFF`
+(`offset_address` in the board definition). The offset matters when flashing — see below.
+
+`.pio/` is gitignored, so **copy the file out** of the build directory if you want to archive or
+ship it.
+
+### 2a. Flash by drag & drop (no tooling required)
+
+The XIAO has a UF2 bootloader, so the friendliest artifact is a `.uf2` rather than the `.bin`.
+Convert it with [`tools/bin2uf2.py`](tools/bin2uf2.py) (pure Python, no dependencies):
+
+```
+python tools\bin2uf2.py .pio\build\seeed_xiao\firmware.bin .pio\build\seeed_xiao\firmware.uf2
+```
+
+Then:
+
+1. **Double-tap the reset pad** on the XIAO → a USB drive named **Arduino** appears.
+2. **Copy `firmware.uf2`** onto that drive.
+3. The board reboots into the new firmware on its own — verify with the checks in
+   [Testing after a flash](#testing-after-a-flash).
+
+The `0x2000` offset and the SAMD21 family ID are baked into the `.uf2` by the converter, so
+there is nothing to get wrong at flash time. This is the recommended route.
+
+### 2b. Flash the `.bin` with `bossac`
+
+`bossac` is the SAM-BA uploader PlatformIO itself calls; it ships with the Arduino IDE SAMD core
+(e.g. `%LOCALAPPDATA%\Arduino15\packages\arduino\tools\bossac\1.7.0-arduino3\bossac.exe`).
+Double-tap the reset pad first, note the COM port the bootloader exposes, then:
+
+```
+bossac.exe -i -d --port=COM5 -U -i -e -w -v --offset=0x2000 firmware.bin -R
+```
+
+> **`--offset=0x2000` is not optional.** Writing this image at `0x0000` overwrites the
+> bootloader and destroys the drag-and-drop recovery path — re-flashing would then need an
+> SWD probe (Atmel-ICE / J-Link).
+
+### Building without PlatformIO at all
+
+`arduino-cli` produces the same artifacts (`.bin`, `.hex`, and a ready-made `.uf2`):
+
+```
+arduino-cli core install Seeeduino:samd --additional-urls https://files.seeedstudio.com/arduino/package_seeeduino_boards_index.json
+arduino-cli lib install "ArduinoJson@7.4.3"
+arduino-cli compile -b Seeeduino:samd:seeed_XIAO_m0 --output-dir dist src\puit_sensor.ino
+```
+
+Pin the same ArduinoJson version that [`platformio.ini`](platformio.ini) resolves (`^7` → 7.4.3
+at the time of writing) if you want an image comparable to the PlatformIO build.
 
 ## Testing after a flash
 
