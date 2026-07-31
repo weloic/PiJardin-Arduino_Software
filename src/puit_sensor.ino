@@ -25,7 +25,7 @@
 #define LEDPIN LED_BUILTIN
 
 // --- Protocol / firmware identity -------------------------------------------
-#define FW_VERSION "2.0.0"
+#define FW_VERSION "2.1.0"
 #define PROTO_VERSION 2
 
 // --- Defaults and safe bounds for the per-request parameters -----------------
@@ -37,9 +37,33 @@
 #define DEFAULT_TIMEOUT_US 45000UL
 #define MIN_TIMEOUT_US 2000UL
 #define MAX_TIMEOUT_US 60000UL       // ~10 m
-// The sensor raises Echo a few hundred us after a valid trigger, whether or not
-// it will find anything. Nothing within this window means it never answered.
-#define ACK_TIMEOUT_US 2000UL
+// The sensor raises Echo a short while after a valid trigger, whether or not it
+// will find anything. Nothing within this window means it never answered.
+//
+// This is a per-request parameter rather than a constant because the "few
+// hundred us" figure is a datasheet claim, not a measured property of the module
+// actually in the well: proto 1 used pulseIn() with its default 1 s timeout,
+// which waited out any latency at all and so never revealed the true value. A
+// window set too tight reports a perfectly healthy sensor as a hardware fault,
+// which is the worst possible failure mode for this field.
+//
+// MEASURED, 2026-07-31, the module fitted at the well (n=25, 20 C, USB power):
+//   mean 12286.4 us, median 12286, min 12283, max 12289, sd 1.57
+// So the real latency is ~12.3 ms -- 25-40x the datasheet figure, and 6x the
+// 2000 us this constant held before it was measured. At 2000 us every ping on
+// this healthy sensor would have been reported as a hardware fault. The number
+// is also near-deterministic (0.013% sd, identical on the first ping of a
+// burst), which reads as a fixed internal schedule rather than a reaction time.
+//
+// 50 ms is ~4x the measured maximum. The ceiling on this choice is burst
+// duration, and it is not binding: a ping that answers and then finds nothing
+// already costs 12.3 + timeout_us + 3 = 60.3 ms, so an all-timeout n=25 burst
+// takes 1.51 s while an all-dead one at this window takes 1.33 s. The margin is
+// therefore free. Re-measure via ack_max_us if the module is ever replaced --
+// a different module will have a different number, which is why this is tunable.
+#define DEFAULT_ACK_TIMEOUT_US 50000UL
+#define MIN_ACK_TIMEOUT_US 500UL
+#define MAX_ACK_TIMEOUT_US 60000UL
 // A ping abandoned early (small timeout_us) can leave Echo still high; wait this
 // long for it to settle before triggering again.
 #define SETTLE_TIMEOUT_US 40000UL
@@ -66,12 +90,29 @@
 // the distance it implies is physically plausible: an echo off the mounting
 // bracket or from inside the sensor's blind zone is consistent and would
 // otherwise pass as a high-confidence wrong answer.
-enum PingStatus : uint8_t { PING_OK, PING_TIMEOUT, PING_REJECTED, PING_NO_RESPONSE };
+//
+// PING_STUCK is the second way a ping can produce no answer, and it is a
+// different physical fault from PING_NO_RESPONSE: Echo was still HIGH when the
+// ping started, so the trigger was never even fired. That points at the line
+// itself (held high, miswired, damaged input) rather than at a module ignoring
+// a trigger it did receive. It counts inside n_no_response -- both are hardware
+// faults and the documented n == sum invariant must keep holding -- but is also
+// reported separately as n_stuck so the two are never conflated.
+enum PingStatus : uint8_t { PING_OK, PING_TIMEOUT, PING_REJECTED, PING_NO_RESPONSE, PING_STUCK };
+
+// How far one ping got before any distance check. The caller decides OK vs
+// REJECTED from the width; ping() only reports whether the sensor engaged.
+enum PingAck : uint8_t {
+  ACK_STUCK,  // Echo never went idle -- trigger not fired
+  ACK_NONE,   // triggered, but Echo never rose within ack_timeout_us
+  ACK_OK      // Echo rose; the width (or its absence) is the caller's problem
+};
 
 // Parameters for one measurement burst, after defaults, clamping and validation.
 struct MeasureParams {
   int n;                   // pings to fire
   unsigned long timeout_us;
+  unsigned long ack_timeout_us;  // how long to wait for Echo to rise
   float temp_c;            // assumed air temperature, drives the divisor
   float min_cm, max_cm;    // plausibility window
   int min_valid;           // absolute count required, 0 disables the gate
@@ -82,9 +123,15 @@ struct MeasureParams {
 struct Measurement {
   unsigned long pulses[MAX_N];  // raw echo widths; 0 only when PING_TIMEOUT
   float samples[MAX_N];         // derived cm, parallel to pulses
+  // Trigger -> Echo-rise latency per ping, 0 when the sensor never answered.
+  // Measured rather than assumed: it is the only way to tell a module that is
+  // merely slower than ack_timeout_us from one that is genuinely dead.
+  unsigned long ack_us[MAX_N];
   PingStatus status[MAX_N];
   // always: n == n_valid + n_timeout + n_rejected + n_no_response
   int n, n_valid, n_timeout, n_rejected, n_no_response;
+  int n_stuck;                  // subset of n_no_response, NOT a separate bucket
+  unsigned long ack_max_us;     // largest ack_us over answered pings, 0 if none
   unsigned long median_pulse;
   float median, min, max;       // over PING_OK samples only
 };
@@ -256,16 +303,31 @@ void handleSampling(JsonVariantConst id, JsonVariantConst req) {
     }
   }
 
-  // One character per ping, in order: V)alid, R)ejected, T)imeout, N)o response.
-  // The two null cases above are indistinguishable in the arrays, and reading
+  // Latency from trigger to Echo rising, index-aligned with the arrays above.
+  // Populated for every ping the sensor answered -- including T)imeouts, which
+  // produce no width but did engage, and are therefore the cheapest evidence
+  // that the module is alive and how quickly it reacts.
+  JsonArray acks = doc["ack_us"].to<JsonArray>();
+  for (int i = 0; i < m.n; i++) {
+    if (m.status[i] == PING_NO_RESPONSE || m.status[i] == PING_STUCK) {
+      acks.add(nullptr);
+    } else {
+      acks.add(m.ack_us[i]);
+    }
+  }
+
+  // One character per ping, in order: V)alid, R)ejected, T)imeout, N)o response,
+  // S)tuck. The null cases above are indistinguishable in the arrays, and reading
   // the pattern beats re-deriving it from min_cm/max_cm -- a glance shows
   // whether losses are scattered (noise) or clustered (intermittent contact).
+  // N and S are both counted by n_no_response: count('N') + count('S') == it.
   char pattern[MAX_N + 1];
   for (int i = 0; i < m.n; i++) {
     switch (m.status[i]) {
       case PING_OK:       pattern[i] = 'V'; break;
       case PING_REJECTED: pattern[i] = 'R'; break;
       case PING_TIMEOUT:  pattern[i] = 'T'; break;
+      case PING_STUCK:    pattern[i] = 'S'; break;
       default:            pattern[i] = 'N'; break;
     }
   }
@@ -287,6 +349,7 @@ void handleStatus(JsonVariantConst id) {
   doc["max_n"] = MAX_N;
   doc["n_default"] = DEFAULT_N;
   doc["timeout_default_us"] = DEFAULT_TIMEOUT_US;
+  doc["ack_timeout_default_us"] = DEFAULT_ACK_TIMEOUT_US;
   doc["min_cm_default"] = DEFAULT_MIN_CM;
   doc["max_cm_default"] = DEFAULT_MAX_CM;
   doc["line_max"] = LINE_MAX;
@@ -327,6 +390,7 @@ bool optFloat(JsonVariantConst req, const char *key, float *out, const char **ba
 bool parseParams(JsonVariantConst req, MeasureParams *p, const char **bad_field) {
   p->n = DEFAULT_N;
   p->timeout_us = DEFAULT_TIMEOUT_US;
+  p->ack_timeout_us = DEFAULT_ACK_TIMEOUT_US;
   p->temp_c = DEFAULT_TEMP_C;
   p->min_cm = DEFAULT_MIN_CM;
   p->max_cm = DEFAULT_MAX_CM;
@@ -334,6 +398,7 @@ bool parseParams(JsonVariantConst req, MeasureParams *p, const char **bad_field)
 
   if (!optInt(req, "n", &p->n, bad_field)) return false;
   if (!optULong(req, "timeout_us", &p->timeout_us, bad_field)) return false;
+  if (!optULong(req, "ack_timeout_us", &p->ack_timeout_us, bad_field)) return false;
   if (!optFloat(req, "temp_c", &p->temp_c, bad_field)) return false;
   if (!optFloat(req, "min_cm", &p->min_cm, bad_field)) return false;
   if (!optFloat(req, "max_cm", &p->max_cm, bad_field)) return false;
@@ -341,6 +406,7 @@ bool parseParams(JsonVariantConst req, MeasureParams *p, const char **bad_field)
 
   p->n = constrain(p->n, 1, MAX_N);
   p->timeout_us = constrain(p->timeout_us, MIN_TIMEOUT_US, MAX_TIMEOUT_US);
+  p->ack_timeout_us = constrain(p->ack_timeout_us, MIN_ACK_TIMEOUT_US, MAX_ACK_TIMEOUT_US);
   p->temp_c = constrain(p->temp_c, MIN_TEMP_C, MAX_TEMP_C);
   p->min_cm = constrain(p->min_cm, 0.0f, ABS_MAX_CM);
   p->max_cm = constrain(p->max_cm, 0.0f, ABS_MAX_CM);
@@ -391,10 +457,17 @@ void addContext(JsonDocument &doc, const Measurement *m, const MeasureParams *p)
   doc["n_timeout"] = m->n_timeout;
   doc["n_rejected"] = m->n_rejected;
   doc["n_no_response"] = m->n_no_response;
+  doc["n_stuck"] = m->n_stuck;  // breakdown of n_no_response, not a fifth bucket
+  // The measured trigger->rise latency. Its whole purpose is to make
+  // ack_timeout_us falsifiable: if a burst reports n_no_response == n while a
+  // working burst reports ack_max_us close to the window, the window is the
+  // fault, not the sensor. 0 means nothing answered and says nothing either way.
+  doc["ack_max_us"] = m->ack_max_us;
   doc["temp_c"] = p->temp_c;
   doc["min_cm"] = p->min_cm;
   doc["max_cm"] = p->max_cm;
   doc["timeout_us"] = p->timeout_us;
+  doc["ack_timeout_us"] = p->ack_timeout_us;
   doc["min_valid"] = p->min_valid;
 }
 
@@ -471,23 +544,33 @@ float cmDivisorFor(float temp_c) {
 
 // Fire one ping and measure the echo width in microseconds.
 //
-// This replaces pulseIn() in order to separate two failures it reports
-// identically as 0: the sensor never answering the trigger, and the sensor
-// answering but finding nothing in range. *answered distinguishes them.
-//   *answered == false, returns 0  -> never reacted (hardware fault)
-//   *answered == true,  returns 0  -> reacted, no echo within timeout_us
-//   *answered == true,  returns >0 -> echo width in us
+// This replaces pulseIn() in order to separate failures it reports identically
+// as 0: the sensor never answering the trigger, and the sensor answering but
+// finding nothing in range. *ack distinguishes them, and splits the first case
+// further into "the line was never idle" and "the trigger was ignored".
+//   *ack == ACK_STUCK, returns 0  -> Echo held high, trigger never fired
+//   *ack == ACK_NONE,  returns 0  -> triggered, no rise within ack_timeout_us
+//   *ack == ACK_OK,    returns 0  -> reacted, no echo within timeout_us
+//   *ack == ACK_OK,    returns >0 -> echo width in us
+//
+// *ack_us receives the trigger -> rise latency whenever *ack is ACK_OK, and 0
+// otherwise. It is reported rather than discarded because ack_timeout_us is the
+// one parameter here with no physical ground truth behind it: without the
+// measurement, a window set too tight and a dead sensor are indistinguishable.
 //
 // Timing is a digitalRead poll rather than pulseIn's tuned assembly, so the
 // resolution is a couple of microseconds (~0.03 cm) instead of one -- far below
 // the sensor's own real-world accuracy.
-unsigned long ping(unsigned long timeout_us, bool *answered) {
-  *answered = false;
+unsigned long ping(unsigned long timeout_us, unsigned long ack_timeout_us,
+                   PingAck *ack, unsigned long *ack_us) {
+  *ack = ACK_STUCK;
+  *ack_us = 0;
 
   // Echo must be idle before triggering: a ping abandoned early (small
   // timeout_us) can still be holding the line high, and measuring the tail of
   // the previous pulse would look like a plausible reading. A line that never
-  // settles is itself a fault, reported as "never answered".
+  // settles is itself a fault -- and a different one from an ignored trigger,
+  // since no trigger is fired at all in this path.
   unsigned long t0 = micros();
   while (digitalRead(ECHOPIN) == HIGH) {
     if (micros() - t0 > SETTLE_TIMEOUT_US) return 0;
@@ -500,15 +583,18 @@ unsigned long ping(unsigned long timeout_us, bool *answered) {
   digitalWrite(TRIGPIN, LOW);   // Send pin low again
 
   // The sensor raises Echo shortly after a valid trigger even when it will find
-  // nothing, so no rise at all means it is not responding.
+  // nothing, so no rise at all means it is not responding. Time from the falling
+  // edge of the trigger, which is the moment the sensor starts its cycle.
+  *ack = ACK_NONE;
   t0 = micros();
   while (digitalRead(ECHOPIN) == LOW) {
-    if (micros() - t0 > ACK_TIMEOUT_US) return 0;
+    if (micros() - t0 > ack_timeout_us) return 0;
   }
-  *answered = true;
+  unsigned long rise = micros();
+  *ack_us = rise - t0;
+  *ack = ACK_OK;
 
   // Echo is high: time how long it stays high.
-  unsigned long rise = micros();
   while (digitalRead(ECHOPIN) == HIGH) {
     if (micros() - rise > timeout_us) return 0;
   }
@@ -516,9 +602,15 @@ unsigned long ping(unsigned long timeout_us, bool *answered) {
   return (width == 0) ? 1 : width;  // never return 0 for a real echo
 }
 
-// Fire p->n pings and classify each one into the four PingStatus buckets, so
-// the Pi can tell a dead sensor from a blind one from a misaimed one. Echoes
-// outside [min_cm, max_cm] keep their value but are excluded from the statistics.
+// Fire p->n pings and classify each one, so the Pi can tell a dead sensor from a
+// blind one from a misaimed one. Echoes outside [min_cm, max_cm] keep their value
+// but are excluded from the statistics.
+//
+// Five PingStatus values, but still only four counting buckets: PING_STUCK is
+// counted inside n_no_response alongside PING_NO_RESPONSE, so the documented
+// n == n_valid + n_timeout + n_rejected + n_no_response invariant is preserved
+// and n_stuck is purely additional detail. Reporting it as a fifth bucket would
+// have broken every existing consumer of that sum for no gain.
 void measure(Measurement *m, const MeasureParams *p) {
   const float divisor = cmDivisorFor(p->temp_c);
   m->n = p->n;
@@ -526,13 +618,29 @@ void measure(Measurement *m, const MeasureParams *p) {
   m->n_timeout = 0;
   m->n_rejected = 0;
   m->n_no_response = 0;
+  m->n_stuck = 0;
+  m->ack_max_us = 0;
 
   for (int i = 0; i < p->n; i++) {
-    bool answered = false;
-    unsigned long pulse = ping(p->timeout_us, &answered);
+    PingAck ack = ACK_STUCK;
+    unsigned long ack_us = 0;
+    unsigned long pulse = ping(p->timeout_us, p->ack_timeout_us, &ack, &ack_us);
     m->pulses[i] = pulse;
+    m->ack_us[i] = ack_us;
 
-    if (!answered) {
+    // Every ping that engaged feeds ack_max_us, including the ones that then
+    // timed out or fell outside the window: what is being characterised here is
+    // the sensor's reaction time, not the quality of the reading.
+    if (ack == ACK_OK && ack_us > m->ack_max_us) {
+      m->ack_max_us = ack_us;
+    }
+
+    if (ack == ACK_STUCK) {
+      m->samples[i] = 0.0f;
+      m->status[i] = PING_STUCK;
+      m->n_stuck++;
+      m->n_no_response++;  // superset: keeps n == sum of the four buckets
+    } else if (ack == ACK_NONE) {
       m->samples[i] = 0.0f;
       m->status[i] = PING_NO_RESPONSE;
       m->n_no_response++;

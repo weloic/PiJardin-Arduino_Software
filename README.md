@@ -44,7 +44,7 @@ the Pi can correlate replies and ignore stray lines; sensor failures are reporte
   identify what it is talking to from any reply, not just the banner.
 - **Boot banner:** on reset the board prints one line and nothing else until commanded:
   ```json
-  {"type":"ready","proto":2,"fw":"2.0.0"}
+  {"type":"ready","proto":2,"fw":"2.1.0"}
   ```
   The Pi resets the board (DTR toggle) and waits for a line that parses to JSON with
   `type == "ready"` before issuing commands.
@@ -71,6 +71,7 @@ Optional on `read_puit` and `sampling`; ignored by `status`. Absent — or expli
 |--------------|-------|------------------|----------------|-------|
 | `n`          | int   | `10`             | 1 – 25         | pings per burst |
 | `timeout_us` | int   | `45000`          | 2000 – 60000   | per-ping echo timeout; also caps reachable distance (~772 cm at the default). Deliberately above the sensor's ~38 ms "nothing found" pulse — see below |
+| `ack_timeout_us` | int | `50000`        | 500 – 60000    | how long to wait for echo to **rise** after a trigger before calling the ping a no-response. The fitted module actually takes **~12.3 ms**, so the default is ~4× measured. Sweep this when diagnosing `sensor_fault` — see below |
 | `temp_c`     | float | `20.0`           | −20 – 60       | assumed air temperature; drives the µs→cm divisor |
 | `min_cm`     | float | `5.0`            | 0 – 1030       | lower edge of the plausibility window |
 | `max_cm`     | float | `500.0`          | 0 – 1030       | upper edge; additionally capped to what `timeout_us` can reach |
@@ -113,6 +114,19 @@ implies is plausible. Every ping lands in exactly one of four buckets:
 `n_rejected: 10` means *the sensor is alive and aimed at the wrong thing*, while
 `n_no_response: 10` means *the sensor is not talking to us at all*.
 
+Two further fields refine that picture without disturbing the invariant above:
+
+| Field        | Meaning |
+|--------------|---------|
+| `n_stuck`    | **subset of `n_no_response`** (never a fifth bucket): echo was still HIGH when the ping began, so the trigger was never fired at all. Points at the *line* — held high, miswired, damaged input — rather than a module ignoring a trigger it received |
+| `ack_max_us` | the largest trigger→rise latency actually **measured** across the burst; `0` when nothing answered |
+
+`ack_max_us` exists because `ack_timeout_us` is the one parameter with no physical ground truth
+behind it, and getting it wrong is silent: a window set below the module's real reaction time turns
+a perfectly healthy sensor into `sensor_fault` on every ping. Comparing a working burst's
+`ack_max_us` against the window is what makes that falsifiable rather than a guess. See
+[When `sensor_fault` might not be the sensor](#when-sensor_fault-might-not-be-the-sensor).
+
 The default window (5–500 cm) rejects only the physically impossible — the blind zone below, the
 sensor's reach above — without assuming anything about the well. Narrow it via `min_cm`/`max_cm`
 once the real geometry is trusted.
@@ -136,14 +150,90 @@ echo     ____|‾‾‾|_____             echo     ____|‾‾‾‾‾‾‾‾
 `pulseIn()` reports **0** for both of the right-hand cases, which is why `proto 1` conflated them.
 `proto 2` handles it two ways at once:
 
-- The firmware waits ~2 ms for echo to **rise** after each trigger. The sensor raises it whether or
-  not it finds anything, so no rise at all is an unambiguous hardware fault → `n_no_response`.
+- The firmware waits `ack_timeout_us` (default **50 ms**) for echo to **rise** after each trigger.
+  The sensor raises it whether or not it finds anything, so no rise at all is a hardware fault →
+  `n_no_response`. The default is far above the datasheet's "few hundred µs" because the fitted
+  module measurably takes **12.3 ms** and because the cost of being wrong is asymmetric — see
+  [When `sensor_fault` might not be the sensor](#when-sensor_fault-might-not-be-the-sensor).
 - `timeout_us` defaults to **45 ms**, past the sensor's ~38 ms "nothing found" pulse. So a
   live-but-blind sensor produces a real ~652 cm reading (→ `n_rejected`, since it exceeds
   `max_cm`) rather than a silent zero.
 
 Belt and braces: the first works on any module; the second means even a module with unusual timing
 still looks different from a dead one.
+
+#### When `sensor_fault` might not be the sensor
+
+The rise detection above rests on one assumption — *the module raises echo quickly* — and that
+assumption is the only part of the measurement path with no physical ground truth behind it. Every
+other bound is derived from something real: `timeout_us` from the speed of sound, `max_cm` from the
+well's geometry, `min_cm` from the published blind zone. The rise deadline comes from a datasheet
+figure for a part number that clone modules print on the silkscreen without honouring.
+
+That matters because the failure is **silent and total**. A deadline set below the module's real
+reaction time does not degrade the reading — it converts a perfectly healthy sensor into
+`n_no_response: n`, on every ping, forever, with a `code` that says *"unpowered, dead, or a wire
+off"* and a decision table that says *do not retry, alert a human*. The firmware would be lying with
+complete confidence, and the alert would send someone to the well to look at hardware that is fine.
+This is the same class of bug as the `proto 1` blind-zone problem the plausibility window was added
+to fix: not a wrong number, but **unearned certainty**.
+
+`proto 1` never exposed it, because it used `pulseIn()` with the Arduino default timeout — **one
+full second** to wait for the rise. That absorbed any latency any module could plausibly have, and
+so never revealed what the real figure was.
+
+**This is not hypothetical — it was measured, and the assumption was wrong.** On the module fitted
+at the well (`n=25`, 20 °C, USB power):
+
+| | µs |
+|---|---|
+| mean | 12286.4 |
+| median | 12286 |
+| min / max | 12283 / 12289 |
+| std dev | 1.57 |
+
+**~12.3 ms**, against a datasheet figure of a few hundred µs — and against the **2 ms** this
+firmware used before anyone checked. At 2 ms, *every ping on this healthy sensor reports a hardware
+fault.* The clone honours the pinout and the pulse encoding but not the timing, exactly as the
+paragraph above feared.
+
+Note the spread: 1.57 µs std dev, 0.013 %, and identical on the first ping of a burst. That is a
+fixed internal schedule, not a variable reaction time — which is what makes a bound around it
+meaningful rather than a coin flip.
+
+Three things follow, and together they make the assumption falsifiable:
+
+- **`ack_max_us` is measured and reported**, on every measurement reply. On a burst that works, it
+  is the module's true reaction time; compare it against the echoed `ack_timeout_us` to see how much
+  margin you actually have.
+- **`ack_timeout_us` is a request parameter**, so the window can be swept from the Pi across a range
+  without reflashing. If `n_no_response: n` at 2 ms becomes `n_valid: n` at 50 ms, the window was
+  the fault and the sensor was never broken.
+- **The default is 50 ms** — ~4× the measured maximum. The only thing traded away by erring long is
+  burst duration, and that trade is **free here**: a ping that answers and then finds nothing already
+  costs `12.3 + timeout_us + 3` = 60.3 ms, so an all-timeout `n=25` burst takes **1.51 s** while an
+  all-dead one at this window takes 1.33 s. The window is not what bounds the worst case, so buying
+  margin with it costs nothing. Erring short costs a false hardware alert.
+
+⚠️ **Size the Pi's serial read timeout against 1.51 s, not against a good reading.** A healthy burst
+returns in ~0.5 s, but a fully blind one takes three times that. Too short a timeout turns a
+carefully diagnosed `sensor_fault` into a generic comms error at precisely the moment the diagnosis
+matters.
+
+Diagnostic recipe when a `sensor_fault` looks suspicious:
+
+```json
+{"id":1,"cmd":"sampling","n":5,"ack_timeout_us":60000}
+```
+
+| Result | Reading |
+|--------|---------|
+| `ok`, and `ack_max_us` well above the old window | the window was too tight — set the default from `ack_max_us`. This is what happened at 2 ms |
+| `sensor_fault`, `ping_status` all `N` | triggers are going out and nothing answers — genuine fault, or the trigger line |
+| `sensor_fault`, `ping_status` all `S` | echo never went idle, so **no trigger was ever fired** — the echo line is held high: miswiring, a level-shifter leg, or a damaged input |
+
+The `N` vs `S` split is the reason `n_stuck` exists. They are both hardware faults, but they send
+you to opposite ends of the wiring.
 
 ### Responses (board → Pi)
 
@@ -155,8 +245,8 @@ All responses carry `"type":"resp"`, `"proto":2`, the echoed `id`, and a `status
 ```json
 {"id":42,"type":"resp","proto":2,"status":"ok","value":123.4,"unit":"cm","pulse_us":7186,
  "min":122.8,"max":124.1,"spread":1.3,
- "n":10,"n_valid":9,"n_timeout":1,"n_rejected":0,"n_no_response":0,
- "temp_c":20,"min_cm":5,"max_cm":500,"timeout_us":45000,"min_valid":5}
+ "n":10,"n_valid":9,"n_timeout":1,"n_rejected":0,"n_no_response":0,"n_stuck":0,"ack_max_us":12289,
+ "temp_c":20,"min_cm":5,"max_cm":500,"timeout_us":45000,"ack_timeout_us":50000,"min_valid":5}
 ```
 
 `sampling` — the same, plus per-ping detail for diagnostics:
@@ -164,27 +254,36 @@ All responses carry `"type":"resp"`, `"proto":2`, the echoed `id`, and a `status
 ```json
 {"id":43,"type":"resp","proto":2,"status":"ok","value":123.4,"unit":"cm",
  "min":122.8,"max":124.1,"spread":1.3,
- "n":10,"n_valid":9,"n_timeout":1,"n_rejected":0,"n_no_response":0,
- "temp_c":20,"min_cm":5,"max_cm":500,"timeout_us":45000,"min_valid":5,
+ "n":10,"n_valid":9,"n_timeout":1,"n_rejected":0,"n_no_response":0,"n_stuck":0,"ack_max_us":12289,
+ "temp_c":20,"min_cm":5,"max_cm":500,"timeout_us":45000,"ack_timeout_us":50000,"min_valid":5,
  "samples":[123.4,null,124.0,…],"pulse_us":[7186,null,7221,…],
- "ping_status":"VTVVVVVVVV"}
+ "ack_us":[12286,12289,12285,…],"ping_status":"VTVVVVVVVV"}
 ```
 
-In the arrays, `null` marks a ping that produced no pulse width at all — either no echo or no
-response. A ping that echoed but fell outside the window keeps its cm and µs values: raw truth is
-never discarded, only excluded from the statistics. The two arrays are index-aligned.
+In `samples` and `pulse_us`, `null` marks a ping that produced no pulse width at all — either no
+echo or no response. A ping that echoed but fell outside the window keeps its cm and µs values: raw
+truth is never discarded, only excluded from the statistics.
+
+`ack_us` is index-aligned with them but follows a **different** rule: it holds the trigger→rise
+latency for every ping the sensor *engaged with*, which includes the `T`imeout pings that produce no
+width. So a `null` in `pulse_us` paired with a number in `ack_us` reads as "the module answered,
+found nothing" — the clearest single indication that a sensor returning no data is nonetheless
+alive. `ack_us` is `null` only for `N` and `S`.
 
 `ping_status` gives one character per ping, in order — **V**alid, **R**ejected, **T**imeout,
-**N**o response. It disambiguates the two `null` cases, and the pattern itself is informative:
-scattered losses (`VVTVVVTVVV`) suggest surface noise, while clustered ones (`VVVVVNNNNN`) suggest
-intermittent contact or a sensor dropping out mid-burst.
+**N**o response, **S**tuck. It disambiguates the `null` cases, and the pattern itself is
+informative: scattered losses (`VVTVVVTVVV`) suggest surface noise, while clustered ones
+(`VVVVVNNNNN`) suggest intermittent contact or a sensor dropping out mid-burst.
+
+`N` and `S` are **both** counted by `n_no_response`, so `count('N') + count('S') == n_no_response`
+and `count('S') == n_stuck`. The character split is a refinement of the count, not a fifth bucket.
 
 `status` — identity plus limits, so the Pi can discover them instead of keeping a second copy of
 these constants:
 
 ```json
-{"id":44,"type":"resp","proto":2,"status":"ok","fw":"2.0.0","uptime_ms":12345,
- "max_n":25,"n_default":10,"timeout_default_us":45000,
+{"id":44,"type":"resp","proto":2,"status":"ok","fw":"2.1.0","uptime_ms":12345,
+ "max_n":25,"n_default":10,"timeout_default_us":45000,"ack_timeout_default_us":50000,
  "min_cm_default":5,"max_cm_default":500,"line_max":192}
 ```
 
@@ -228,24 +327,32 @@ failure *modes* rather than just success/failure:
 | `n_timeout` | occasionally 1–2 | sensor answered, no echo: ripples, oblique surface, absorbent water |
 | `n_rejected` | `0` | echo outside the window: misaim, bracket, blind zone, or the ~652 cm "nothing found" artefact |
 | `n_no_response` | **always 0** | sensor ignored the trigger: **hardware** — power, wiring, dying module |
+| `n_stuck` | **always 0** | subset of the above: echo line held HIGH, trigger never fired — wiring, not the module |
+| `ack_max_us` | stable, a few hundred µs | not a fault signal; **trend it** — a reaction time creeping toward `ack_timeout_us` is a module going soft, and the point at which healthy pings start being reported as faults |
 
 The asymmetry matters when choosing log levels: `n_timeout` has benign causes, **`n_no_response`
 does not**. Any non-zero `n_no_response`, even on an otherwise perfect `ok` reading, is worth a
 warning — it is the earliest signal of a failing connection, and no `min_valid` threshold will
 surface it because the burst still succeeds.
 
+Before treating a *fully* failed burst as a dead sensor, though, check `ack_max_us` against the
+echoed `ack_timeout_us`: see
+[When `sensor_fault` might not be the sensor](#when-sensor_fault-might-not-be-the-sensor).
+
 **Level 3 — `ping_status`: which ping, in what pattern.** One character per ping, `sampling` only:
 
-| Char | Outcome | `samples[i]` / `pulse_us[i]` |
-|------|---------|------------------------------|
-| `V` | valid | the values |
-| `R` | rejected — echoed, outside the window | the values (kept deliberately) |
-| `T` | timeout — answered, no echo | `null` |
-| `N` | no response — trigger ignored | `null` |
+| Char | Outcome | `samples[i]` / `pulse_us[i]` | `ack_us[i]` |
+|------|---------|------------------------------|-------------|
+| `V` | valid | the values | latency |
+| `R` | rejected — echoed, outside the window | the values (kept deliberately) | latency |
+| `T` | timeout — answered, no echo | `null` | latency |
+| `N` | no response — trigger fired, ignored | `null` | `null` |
+| `S` | stuck — echo never idle, **trigger never fired** | `null` | `null` |
 
 `V` vs `R` can also be derived by comparing `samples[i]` against the echoed `min_cm`/`max_cm`. **`T`
-vs `N` cannot** — both are `null` in both arrays, so `ping_status` is the only per-ping way to
-separate a blind sensor from a non-responding one. That is why it exists.
+vs `N` cannot** from `samples`/`pulse_us` alone — both are `null` there — though `ack_us` now
+separates them too, since a `T` ping did engage the sensor and an `N` ping did not. `ping_status`
+remains the direct answer, and the only place `S` is visible per ping.
 
 The *pattern* is itself diagnostic: `VVTVVVTVVV` (scattered) reads as surface noise, while
 `VVVVVNNNNN` (clustered) reads as a sensor dropping out mid-burst — an intermittent connection.
@@ -260,11 +367,13 @@ The *pattern* is itself diagnostic: `VVTVVVTVVV` (scattered) reads as surface no
 | `error` | `insufficient_samples` | too few valid pings to trust | warning | **retry** |
 | `error` | `echo_timeout` | sensor answers, finds nothing | warning | **retry** |
 | `error` | `out_of_range` | sensor alive but misaimed / obstructed | **error** | **alert, do not retry** |
-| `error` | `sensor_fault` | sensor not responding at all | **critical** | **alert, do not retry** |
+| `error` | `sensor_fault`, `n_stuck == 0` | triggers fired, sensor never answered — power, module, trigger line | **critical** | **alert, do not retry** |
+| `error` | `sensor_fault`, `n_stuck > 0` | echo line held HIGH, triggers never fired — **echo-side** wiring | **critical** | **alert, do not retry**; points at different wiring than the row above |
 | `error` | `bad_id`, `bad_param`, `bad_request`, `line_too_long`, `unknown_cmd` | bug in the Pi-side request | **error** | fix the code; retrying cannot help |
 
 Retrying only ever helps the two transient rows. `out_of_range` and `sensor_fault` are physical
-problems: something has to be looked at or moved.
+problems: something has to be looked at or moved. Include `n_stuck` and `ack_max_us` in the alert —
+they are what turn "go look at the well" into "go look at the echo wire".
 
 > **Known limitation affecting `n_no_response`.** The firmware currently waits only `delay(3)`
 > between pings, while the HC-SR04 datasheet recommends a ≥60 ms measurement cycle. A trigger
@@ -272,6 +381,10 @@ problems: something has to be looked at or moved.
 > artefact rather than a wiring fault. Until that gap is raised, treat an isolated `N` as worth
 > investigating rather than as proof of a hardware failure; a burst that is mostly or entirely `N`
 > is unambiguous either way.
+>
+> Note this interacts with `ack_timeout_us`: a module still finishing its previous cycle is exactly
+> a module that answers *late*. If `ack_us` shows scattered high values, the ping spacing is the
+> more likely culprit than the module — raise the gap before tightening the window.
 
 #### Sketch of the Pi-side dispatch
 
@@ -286,7 +399,8 @@ if resp["status"] == "ok":
         log.info("puit: %d/%d pings lost", resp["n_valid"], resp["n"])
     store(cm=resp["value"], pulse_us=resp["pulse_us"], temp_c=resp["temp_c"],
           n_valid=resp["n_valid"], n_timeout=resp["n_timeout"],
-          n_rejected=resp["n_rejected"], n_no_response=resp["n_no_response"])
+          n_rejected=resp["n_rejected"], n_no_response=resp["n_no_response"],
+          n_stuck=resp["n_stuck"], ack_max_us=resp["ack_max_us"])
     return resp["value"]
 
 code = resp["code"]
@@ -294,7 +408,10 @@ if code in ("insufficient_samples", "echo_timeout"):
     log.warning("puit: %s (%s)", code, counts(resp))
     raise Retryable(code)
 if code in ("sensor_fault", "out_of_range"):
-    log.error("puit: %s (%s) -- needs physical attention", code, counts(resp))
+    # n_stuck says which end of the wiring to look at; ack_max_us == 0 confirms
+    # nothing answered at all, rather than answering just outside the window.
+    log.error("puit: %s (%s) n_stuck=%d ack_max_us=%d -- needs physical attention",
+              code, counts(resp), resp["n_stuck"], resp["ack_max_us"])
     notify_telegram(code, resp)            # deliberately not retried
     raise Permanent(code)
 log.error("puit: protocol bug -- %s %s", code, resp.get("field", ""))
@@ -367,12 +484,14 @@ additive change — no `proto 3`.
   [Telling outcomes apart](#telling-outcomes-apart--how-to-log-this-properly); in short, retry only
   `insufficient_samples` and `echo_timeout`, alert without retrying on `sensor_fault` and
   `out_of_range`, and treat every remaining code as a Pi-side bug.
-- **Record more than cm.** Store `pulse_us`, `temp_c`, and all four counts
-  (`n_valid`/`n_timeout`/`n_rejected`/`n_no_response`) as InfluxDB fields next to the distance, so
-  formula fixes can be replayed over history and a degrading sensor becomes visible as a graph
-  instead of a surprise. Graphing `n_valid / n` is the single most useful health signal: a sensor on
-  its way out trends downward for weeks before it fails outright, which no single-burst threshold
-  can tell you.
+- **Record more than cm.** Store `pulse_us`, `temp_c`, all four counts
+  (`n_valid`/`n_timeout`/`n_rejected`/`n_no_response`) and `ack_max_us` as InfluxDB fields next to
+  the distance, so formula fixes can be replayed over history and a degrading sensor becomes visible
+  as a graph instead of a surprise. Graphing `n_valid / n` is the single most useful health signal:
+  a sensor on its way out trends downward for weeks before it fails outright, which no single-burst
+  threshold can tell you. `ack_max_us` is the second: it is the module's reaction time, and a slow
+  upward trend in it is both an early warning and the thing that eventually trips `ack_timeout_us`
+  into reporting a live sensor as dead.
 - **A single lost ping is not an error.** Occasional timeouts over water are normal, and the median
   over the survivors is still sound. If you want to *log* imperfect bursts without losing the
   reading, check `n_valid < n` on a successful response — the counts are there precisely for that.
@@ -495,9 +614,9 @@ at the time of writing) if you want an image comparable to the PlatformIO build.
 
 Open the serial monitor at 9600 baud and reset the board.
 
-1. **Banner** → `{"type":"ready","proto":2,"fw":"2.0.0"}`.
+1. **Banner** → `{"type":"ready","proto":2,"fw":"2.1.0"}`.
 2. `{"id":1,"cmd":"status"}` → `ok` with `fw`/`uptime_ms` and the limits
-   (`max_n:25`, `n_default:10`, `line_max:192`).
+   (`max_n:25`, `n_default:10`, `ack_timeout_default_us:50000`, `line_max:192`).
 3. `{"id":2,"cmd":"read_puit"}` → `ok` with a numeric `value` in cm, the four counts summing to `n`,
    and `min`/`max`/`spread`. **Check `value ≈ pulse_us / 58.24` by hand** — that is the regression
    guard for the divisor. Against a tape-measured target the reading should be **unchanged from
@@ -530,12 +649,27 @@ Open the serial monitor at 9600 baud and reset the board.
      the 38 ms pulse — harmless, the rise detection still catches genuine faults, but note it.
    - Run `sampling` in each case and read `ping_status`: `NNNNNNNNNN` for a fault, `RRRRRRRRRR` for
      blind-but-alive.
-8. **Errors:** send `hello` → `bad_request` with `"id":null`. Send `{"cmd":"status"}` → `bad_id`.
-   Send `{"id":9,"cmd":"nope"}` → `unknown_cmd` with `"id":9`. Paste a line longer than 192
+   - **Tie echo (D7) high** (to 3V3 through a resistor) → `sensor_fault` with `ping_status` all `S`
+     and `n_stuck: n`, *not* `N`. The trigger is never fired in this path, so this is the one fault
+     that a scope on D8 shows as silence rather than as pulses going nowhere.
+8. **Re-check `ack_timeout_us` — required whenever the sensor module is replaced.** The default is
+   calibrated to the module currently fitted (~12.3 ms); a replacement clone may differ by an order
+   of magnitude in either direction, and getting this wrong reports healthy hardware as dead.
+   - `{"id":10,"cmd":"sampling","n":25}` → read `ack_max_us` and the `ack_us` array. Expect a tight
+     spread; a *scattered* one points at the `delay(3)` ping spacing rather than the module.
+   - If `ack_max_us` has moved, set `DEFAULT_ACK_TIMEOUT_US` to ~4× the new maximum, and record the
+     measurement in the commit message the way the current one is recorded in the sketch. Keep it
+     under ~50 ms or the all-dead burst starts to exceed the 1.51 s all-timeout worst case.
+   - Confirm the failure direction is understood: `{"id":11,"cmd":"read_puit","ack_timeout_us":500}`
+     on a *working* sensor must produce `sensor_fault` with `n_no_response: n`. **This is the
+     firmware calling healthy hardware dead**, reproduced deliberately — the exact bug that shipped
+     at 2 ms. Re-run without the override to confirm it recovers.
+9. **Errors:** send `hello` → `bad_request` with `"id":null`. Send `{"cmd":"status"}` → `bad_id`.
+   Send `{"id":12,"cmd":"nope"}` → `unknown_cmd` with `"id":12`. Paste a line longer than 192
    characters → `line_too_long`, then confirm the **next** valid request still answers — that proves
    the reader recovers by draining to the newline.
-9. **Reader:** send two requests back-to-back with no delay → two correlated responses, no lost
-   line. Send an empty line → no reply at all. A `read_puit` should return promptly, with no 200 ms
-   idle penalty and no 1 s timeout stall.
-10. Back on the Pi, once `read_puit.py` is updated for `proto 2`, run `/mesure` (Telegram) or wait
+10. **Reader:** send two requests back-to-back with no delay → two correlated responses, no lost
+    line. Send an empty line → no reply at all. A `read_puit` should return promptly, with no 200 ms
+    idle penalty and no 1 s timeout stall.
+11. Back on the Pi, once `read_puit.py` is updated for `proto 2`, run `/mesure` (Telegram) or wait
     for `sensors.service` — it should record a value, confirming end-to-end compatibility.
