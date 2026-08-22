@@ -1,4 +1,9 @@
-// PiJardin pump sensor firmware -- XIAO SAMD21 + ZMPT101B AC voltage module.
+// PiJardin pump sensor firmware -- XIAO RP2040 + ZMPT101B AC voltage module.
+//
+// NOTE: this board is an RP2040, NOT the SAMD21 the well sensor uses. The two
+// XIAOs are the same footprint and look identical, so check the silkscreen
+// before flashing -- `pio run -e pump` and `-e puit` build for different chips
+// and neither image will run on the other board.
 //
 // Answers one question: is the pump running right now? It does that by looking
 // for mains AC on the pump's own feed, which is a far more honest signal than a
@@ -41,15 +46,23 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 
-// ZMPT101B analog out. A0 is an ADC input on the XIAO SAMD21.
+// ZMPT101B analog out. On the XIAO RP2040 A0 is GPIO26 = ADC0.
 //
 // POWER THE MODULE FROM 3V3, NOT 5V. The ZMPT101B biases its output at Vcc/2 and
-// swings around it, so on 5 V it idles at 2.5 V and peaks near 5 V. The SAMD21's
-// analog inputs are not 5 V tolerant and its ADC reference is VDDANA = 3.3 V, so
-// that arrangement clips every reading and damages the pin. On 3V3 the module
-// idles near mid-scale (~1.65 V, ~2048 counts) and cannot overshoot the pin.
+// swings around it, so on 5 V it idles at 2.5 V and peaks near 5 V. The RP2040's
+// GPIOs are not 5 V tolerant and its ADC reference is 3.3 V, so that arrangement
+// clips every reading and damages the pin. On 3V3 the module idles near
+// mid-scale (~1.65 V, ~2048 counts) and cannot overshoot the pin. Unchanged from
+// the SAMD21 version: different chip, same 3.3 V limit, same reason.
 #define VPIN A0
+
+// GPIO17, the red user LED. THE XIAO RP2040'S USER LEDS ARE ACTIVE LOW -- the
+// pin is pulled low to light them. Driving this the intuitive way round would
+// leave the LED on whenever the board is idle and dark while it is working,
+// which is backwards for a busy indicator and reads as a hung board.
 #define LEDPIN LED_BUILTIN
+#define LED_ON LOW
+#define LED_OFF HIGH
 
 // --- Protocol / firmware identity -------------------------------------------
 // proto is numbered per firmware, not per repo: this board shares the well
@@ -65,17 +78,29 @@
 // the RMS below it is an underestimate. Counted, not fatal -- for on/off
 // purposes a clipped waveform still unambiguously means "on".
 #define CLIP_MARGIN 4
-// The SAMD21's first conversion after power-up or a mux change is unreliable.
-// Throw a few away before the timed window rather than letting them skew bias.
+// The first conversions after power-up or a mux change are unreliable, on the
+// RP2040's SAR ADC as on the SAMD21's. Throw a few away before the timed window
+// rather than letting them skew bias.
 #define DISCARD_READS 8
 // Below this RMS (counts) no frequency is derived at all -- see analyse(). A
 // real signal at any usable gain sits in the hundreds, so this only ever gates
 // out traces that are pure noise.
+//
+// Worth re-checking on this board specifically. The RP2040's SAR ADC has a
+// documented differential-nonlinearity problem -- a handful of codes it will
+// never return, which shows up as extra counts of apparent noise on a quiet
+// input. If the measured pump-off RMS comes back near or above this value the
+// guard is not guarding, and freq_hz goes back to being derived from noise.
+// Measure the real floor during calibration and raise this to ~3x it if needed;
+// tools/pump_tune.py prints the figure you need.
 #define FREQ_MIN_RMS 10.0f
 
 // --- Sampling window ---------------------------------------------------------
 // Samples are stored rather than accumulated on the fly, so the buffer is what
-// bounds the window. 1200 x uint16 = 2.4 kB of the 32 kB available.
+// bounds the window. 1200 x uint16 = 2.4 kB, which the RP2040's 264 kB leaves
+// room to grow -- but the size is part of the published contract (`status`
+// returns max_samples, and the Pi sizes its expectations from it), so raising it
+// is a protocol change, not a free win.
 #define MAX_SAMPLES 1200
 #define DEFAULT_CYCLES 10            // 200 ms at 50 Hz
 #define MIN_CYCLES 1
@@ -201,7 +226,7 @@ void setup() {
   Serial.begin(9600);
 
   pinMode(LEDPIN, OUTPUT);
-  digitalWrite(LEDPIN, LOW);
+  digitalWrite(LEDPIN, LED_OFF);
 
   // Boot banner: structured "ready" line the Pi waits for after reset.
   JsonDocument doc;
@@ -253,13 +278,13 @@ bool hasContent() {
 
 // Parse one request line and dispatch to the matching handler.
 void handleLine(const char *line) {
-  digitalWrite(LEDPIN, HIGH);  // lit while the request is being served
+  digitalWrite(LEDPIN, LED_ON);  // lit while the request is being served
 
   JsonDocument req;
   DeserializationError err = deserializeJson(req, line);
   if (err) {
     sendError(nullptr, "bad_request", nullptr);
-    digitalWrite(LEDPIN, LOW);
+    digitalWrite(LEDPIN, LED_OFF);
     return;
   }
 
@@ -269,7 +294,7 @@ void handleLine(const char *line) {
   JsonVariantConst id = req["id"];
   if (!id.is<long>()) {
     sendError(nullptr, "bad_id", nullptr);
-    digitalWrite(LEDPIN, LOW);
+    digitalWrite(LEDPIN, LED_OFF);
     return;
   }
 
@@ -284,7 +309,7 @@ void handleLine(const char *line) {
     sendError(&id, "unknown_cmd", nullptr);
   }
 
-  digitalWrite(LEDPIN, LOW);
+  digitalWrite(LEDPIN, LED_OFF);
 }
 
 // --- Command handlers --------------------------------------------------------
@@ -596,7 +621,7 @@ void sampleWindow(Reading *r, const SampleParams *p) {
   r->truncated = (want > MAX_SAMPLES);
   r->n = r->truncated ? MAX_SAMPLES : (int)want;
 
-  // Discard the SAMD21's unreliable first conversions before timing anything.
+  // Discard the ADC's unreliable first conversions before timing anything.
   for (int i = 0; i < DISCARD_READS; i++) {
     (void)analogRead(VPIN);
   }

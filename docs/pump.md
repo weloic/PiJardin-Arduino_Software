@@ -2,11 +2,15 @@
 
 Detects whether the garden pump is running, by looking for mains AC on the pump's own feed.
 
-- **Board:** Seeed Studio XIAO SAMD21 — the same model as the well sensor.
+- **Board:** Seeed Studio XIAO **RP2040** — ⚠️ *not* the SAMD21 the well sensor uses. Same package,
+  different chip; check the silkscreen before flashing.
 - **Sensor:** ZMPT101B AC voltage module (0–250 V, single phase).
 - **Source:** [src/pump/pump_sensor.cpp](../src/pump/pump_sensor.cpp)
 - **Env:** `pump` — `pio run -e pump -t upload`
 - **Firmware / protocol:** `fw 1.0.0`, `proto 1`
+
+The first `pio run -e pump` downloads the RP2040 platform and toolchain from GitHub — it needs
+network and takes several minutes. Subsequent builds are seconds.
 
 Voltage presence is a more honest signal than the alternatives: either the contactor is closed and
 there are 230 V on the motor, or there are not. A current threshold has to be calibrated against
@@ -24,9 +28,9 @@ See the repo [README](../README.md) for the shared NDJSON envelope, the toolchai
 **Power the ZMPT101B from the XIAO's `3V3` pad. Not `5V`.**
 
 The module biases its analog output at Vcc/2 and swings around it, so on 5 V it idles at 2.5 V and
-peaks near 5 V. The SAMD21's analog inputs are **not 5 V tolerant** and its ADC reference is
-`VDDANA` = 3.3 V. That arrangement clips every reading *and* stresses the pin past its rating. On
-3V3 the module idles near mid-scale (~1.65 V, ~2048 counts) and physically cannot overshoot.
+peaks near 5 V. The RP2040's GPIOs are **not 5 V tolerant** and its ADC reference is 3.3 V. That
+arrangement clips every reading *and* stresses the pin past its rating. On 3V3 the module idles near
+mid-scale (~1.65 V, ~2048 counts) and physically cannot overshoot.
 
 ### 2. Wiring it across the wrong side of the contactor
 
@@ -55,10 +59,49 @@ reading actually drops.
 
 | Signal | Pin | Note |
 | --- | --- | --- |
-| ZMPT101B `OUT` | `A0` | analog in |
+| ZMPT101B `OUT` | `A0` | GPIO26 = ADC0 on the RP2040 |
 | ZMPT101B `VCC` | `3V3` | **not 5V** — see above |
 | ZMPT101B `GND` | `GND` | |
-| Status LED | `LED_BUILTIN` | lit while a command is being served |
+| Status LED | `LED_BUILTIN` | GPIO17, the red LED; lit while a command is served |
+
+The XIAO RP2040's user LEDs are **active low** — the pin is pulled low to light them. The firmware
+uses `LED_ON`/`LED_OFF` rather than `HIGH`/`LOW` for exactly this reason; drive it the intuitive way
+round and the LED is on when idle and dark when working, which reads as a hung board.
+
+### Flashing
+
+```
+pio run -e pump -t upload
+```
+
+That is all, including on a board that is already running the firmware — no BOOT button, no driver
+install. If the board is running, the uploader resets it into the bootloader first.
+
+**Why this board does not use `picotool`.** The default RP2040 upload protocol drives the PICOBOOT
+interface of the BOOTSEL device, for which **Windows ships no driver**, so a stock machine fails
+with:
+
+```
+Device ... appears to be a RP2040 device in BOOTSEL mode, but picotool was unable
+to connect. You may need to install a driver via Zadig.
+```
+
+The same bootloader also exposes plain USB mass storage — the `RPI-RP2` drive — which every OS
+already supports, and copying a `.uf2` there is the method Raspberry Pi documents first. So
+[env:pump] sets `upload_protocol = custom` and points it at
+[tools/flash_uf2.py](../tools/flash_uf2.py), which does the copy. Zadig would work too, but it is a
+manual step on every machine that ever builds this firmware, and aimed at the wrong interface it
+breaks the drive as well.
+
+The RP2040 build emits `.pio/build/pump/firmware.uf2` directly, so
+[tools/bin2uf2.py](../tools/bin2uf2.py) — which is SAMD21-specific — is not used for this board.
+
+**Manual fallback,** for a board whose firmware no longer enumerates: hold **BOOT** while plugging
+in, then copy `.pio/build/pump/firmware.uf2` onto the `RPI-RP2` drive.
+
+> While in BOOTSEL the board presents **only a drive, no serial port**. If `pump_tune.py` or the
+> serial monitor reports no port and you can see an `RPI-RP2` drive, that is why — replug without
+> holding BOOT, or just run `-t upload`.
 
 The module's **multi-turn potentiometer** sets its output gain. It ships at an arbitrary position
 and must be adjusted — see [Calibration](#calibration-required).
@@ -117,6 +160,24 @@ measurement is the worst available failure mode, because nothing downstream can 
 have to be, because the counts-to-volts relationship lives in the module's gain pot and no firmware
 can know where it is set. Left uncalibrated they will misreport.
 
+### The short way
+
+[`tools/pump_tune.py`](../tools/pump_tune.py) drives the protocol from a PC on the bench and does
+all of the below, including the arithmetic and the quality checks (`pip install pyserial`):
+
+```
+python tools/pump_tune.py probe        # one window, with every trap in this page checked
+python tools/pump_tune.py plot         # ASCII waveform -- turn the pot while watching it
+python tools/pump_tune.py calibrate    # guided off/on, prints the two #define lines
+```
+
+`calibrate` derives the thresholds from the **worst** window seen in each state rather than the
+average, and refuses to emit anything if the two states are not separated — which is, among other
+things, what a module on the wrong side of the contactor looks like. The manual procedure below is
+the same thing by hand; use it if you would rather not install pyserial.
+
+### By hand
+
 1. **Flash and connect.** `pio run -e pump -t upload`, then open the serial monitor at 9600.
 2. **Pump OFF** — set the noise floor:
    ```json
@@ -142,7 +203,13 @@ can know where it is set. Left uncalibrated they will misreport.
    ```
    The gap between them is the `"uncertain"` band, and it is doing real work — make it wide. Both
    can be overridden per request, so test candidate values before editing the source.
-5. **Verify both states** with `read_pump`, then rebuild with the values baked in.
+5. **Check the noise floor against `FREQ_MIN_RMS`** (10.0 in the source). That constant is what
+   stops a frequency being derived from pure noise. The RP2040's SAR ADC has a documented
+   differential-nonlinearity problem — a few codes it will never return — which shows up as extra
+   apparent noise on a quiet input, so this board may sit higher than a SAMD21 would. If the
+   pump-off `rms_counts` from step 2 is anywhere near 10, raise `FREQ_MIN_RMS` to about 3× it;
+   otherwise the guard is not guarding and `freq_hz` goes back to being invented from noise.
+6. **Verify both states** with `read_pump`, then rebuild with the values baked in.
 
 Record the numbers you measured in the commit message. The well sensor's `ack_timeout_us` comment
 is the precedent: a constant that was guessed and then measured, with the measurement written down,

@@ -12,13 +12,17 @@ from a laptop**, never remotely from the Pi.
 ## Firmwares in this repo
 
 One repo, **one firmware per physical board**, each built from its own PlatformIO environment.
-All boards are the same model, so they share the toolchain, the serial framing and the flashing
-procedure — only the sensing differs.
+They share the serial framing, but **not the chip** — see the warning below the table.
 
-| Board | Env | Source | Docs | What it does |
-| --- | --- | --- | --- | --- |
-| Well level | `puit` | [src/puit/puit_sensor.cpp](src/puit/puit_sensor.cpp) | this file, below | Distance down to the water surface, HC-SR04 ultrasonic |
-| Pump state | `pump` | [src/pump/pump_sensor.cpp](src/pump/pump_sensor.cpp) | [docs/pump.md](docs/pump.md) | Whether the pump is running, ZMPT101B AC voltage sense |
+| Board | Env | MCU | Source | Docs | What it does |
+| --- | --- | --- | --- | --- | --- |
+| Well level | `puit` | XIAO **SAMD21** | [src/puit/puit_sensor.cpp](src/puit/puit_sensor.cpp) | this file, below | Distance down to the water surface, HC-SR04 ultrasonic |
+| Pump state | `pump` | XIAO **RP2040** | [src/pump/pump_sensor.cpp](src/pump/pump_sensor.cpp) | [docs/pump.md](docs/pump.md) | Whether the pump is running, ZMPT101B AC voltage sense |
+
+> ⚠️ **The two boards are different microcontrollers in an identical package.** A XIAO SAMD21 and a
+> XIAO RP2040 are the same size, the same pin count and the same colour; only the silkscreen tells
+> them apart. They need different platforms, cores and bootloaders, and **an image built for one
+> will not run on the other**. Check the board before `-t upload`.
 
 Both speak the **same NDJSON envelope** (`id` / `type` / `proto` / `status` / `code`) over USB
 serial, documented once in [Serial protocol contract](#serial-protocol-contract) below. They do
@@ -35,6 +39,9 @@ boot banner (the pump firmware sends it) rather than inferring the board from a 
 
 1. `src/<name>/<name>_sensor.cpp`
 2. `[env:<name>]` in [platformio.ini](platformio.ini) with `build_src_filter = -<*> +<<name>/>`
+   **and its own `platform` / `board`** — those are deliberately not in the shared `[env]` block,
+   because the boards are no longer all one chip and an inherited default would quietly build the
+   wrong target.
 
 Sources must be **`.cpp`, not `.ino`**. PlatformIO's sketch conversion only globs the *top level*
 of `src/` and ignores `build_src_filter` while doing it, so a `.ino` here is either skipped (in a
@@ -44,12 +51,16 @@ the `.ino` step ever added.
 
 ## Hardware
 
-Both boards are a **Seeed Studio XIAO SAMD21** (ARM Cortex-M0+, native USB). On every board the
-status LED lights while a command is being processed.
+Both boards are in the **Seeed Studio XIAO** form factor with native USB, but they are different
+chips: the well sensor is a **XIAO SAMD21** (Atmel, Cortex-M0+) and the pump sensor is a **XIAO
+RP2040** (Raspberry Pi, dual Cortex-M0+). On both, the status LED lights while a command is being
+processed — note that the RP2040's user LEDs are **active low**, which the pump firmware accounts
+for.
 
-> ⚠️ **The XIAO is a 3.3 V part and its pins are not 5 V tolerant.** Its ADC reference is
-> `VDDANA` = 3.3 V. Any sensor module with an analog output must be powered from the **3V3** pad,
-> not 5V — see [docs/pump.md](docs/pump.md), where getting this wrong destroys the analog input.
+> ⚠️ **Both are 3.3 V parts and neither is 5 V tolerant.** The SAMD21's ADC reference is
+> `VDDANA` = 3.3 V; the RP2040's is 3.3 V likewise. Any sensor module with an analog output must be
+> powered from the **3V3** pad, not 5V — see [docs/pump.md](docs/pump.md), where getting this wrong
+> destroys the analog input.
 
 **Well sensor (`puit`)** — HC-SR04-style ultrasonic distance sensor, mounted above the well,
 measuring the distance down to the water surface.
@@ -540,17 +551,22 @@ additive change — no `proto 3`.
 
 You flash this by connecting the XIAO directly to your computer over USB.
 
-> ⚠️ **Pick the environment before uploading.** The boards are physically identical and both
-> appear as the same kind of USB device, so nothing stops you flashing the pump firmware onto the
-> well sensor. `-e` is the only thing that decides which firmware gets written. Bare `pio run`
-> defaults to `puit` (set by `default_envs` in [platformio.ini](platformio.ini)); anything to do
-> with the pump board must say `-e pump` explicitly.
+> ⚠️ **Pick the environment before uploading.** The boards are physically identical, so nothing
+> stops you aiming the pump firmware at the well sensor. `-e` is the only thing that decides which
+> firmware gets written. Bare `pio run` defaults to `puit` (set by `default_envs` in
+> [platformio.ini](platformio.ini)); anything to do with the pump board must say `-e pump`.
+>
+> They are also **different chips** — SAMD21 for `puit`, RP2040 for `pump` — so a mismatched upload
+> now fails at the flashing step rather than producing a bricked-looking board. That is a safety net,
+> not a reason to stop checking the silkscreen.
 
 1. **Install the PlatformIO IDE extension** in VSCode. Opening this folder will prompt you to
    install it (see [`.vscode/extensions.json`](.vscode/extensions.json)).
-2. **Open this folder** in VSCode. PlatformIO reads [`platformio.ini`](platformio.ini) and, on
-   the first build, automatically downloads the SAMD (`atmelsam`) platform and toolchain — no
-   manual "board core" install like the Arduino IDE requires.
+2. **Open this folder** in VSCode. PlatformIO reads [`platformio.ini`](platformio.ini) and, on the
+   first build, automatically downloads each environment's platform and toolchain — no manual
+   "board core" install like the Arduino IDE requires. The two envs pull **different** toolchains
+   (`atmelsam` for `puit`, an RP2040 one for `pump`), so expect the first `-e pump` build to take
+   several minutes and need network.
 3. **Connect the board** over USB — and be sure which one it is.
 4. **Upload:**
    ```
