@@ -1,21 +1,58 @@
 # PiJardin — Arduino Software
 
-Firmware for the **PiJardin** well ("puit") water-level sensor. This is the companion
+Microcontroller firmware for the **PiJardin** garden monitoring project. This is the companion
 repository to the main [PiJardin](https://github.com/wermeill/PiJardin) project: PiJardin
 runs the Raspberry Pi side (Python, InfluxDB, Grafana, Telegram bot), and **this repo holds
-the microcontroller firmware** that actually reads the ultrasonic sensor.
+the firmware** for the boards that do the actual sensing.
 
 The two are kept separate on purpose — different toolchain (C++/Arduino vs Python) and a
 different lifecycle (the firmware changes rarely). Firmware is flashed **physically over USB
 from a laptop**, never remotely from the Pi.
 
+## Firmwares in this repo
+
+One repo, **one firmware per physical board**, each built from its own PlatformIO environment.
+All boards are the same model, so they share the toolchain, the serial framing and the flashing
+procedure — only the sensing differs.
+
+| Board | Env | Source | Docs | What it does |
+| --- | --- | --- | --- | --- |
+| Well level | `puit` | [src/puit/puit_sensor.cpp](src/puit/puit_sensor.cpp) | this file, below | Distance down to the water surface, HC-SR04 ultrasonic |
+| Pump state | `pump` | [src/pump/pump_sensor.cpp](src/pump/pump_sensor.cpp) | [docs/pump.md](docs/pump.md) | Whether the pump is running, ZMPT101B AC voltage sense |
+
+Both speak the **same NDJSON envelope** (`id` / `type` / `proto` / `status` / `code`) over USB
+serial, documented once in [Serial protocol contract](#serial-protocol-contract) below. They do
+**not** share a command set, and `proto` is numbered **per firmware** — the pump board is at
+`proto 1` while the well sensor is at `proto 2`. There is nothing for a new board's contract to be
+version 2 *of*, so each starts at 1 and is versioned independently. Always read `role` from the
+boot banner (the pump firmware sends it) rather than inferring the board from a `proto` number.
+
+> **Everything from [Serial protocol contract](#serial-protocol-contract) to the end of this file
+> describes the well sensor.** The pump board's contract, wiring and — importantly — its required
+> **calibration** live in [docs/pump.md](docs/pump.md).
+
+### Adding a third board
+
+1. `src/<name>/<name>_sensor.cpp`
+2. `[env:<name>]` in [platformio.ini](platformio.ini) with `build_src_filter = -<*> +<<name>/>`
+
+Sources must be **`.cpp`, not `.ino`**. PlatformIO's sketch conversion only globs the *top level*
+of `src/` and ignores `build_src_filter` while doing it, so a `.ino` here is either skipped (in a
+subfolder) or concatenated with the others into one translation unit with several `setup()`/`loop()`
+pairs. A `.cpp` needs `#include <Arduino.h>` and its own function prototypes — the only two things
+the `.ino` step ever added.
+
 ## Hardware
 
-- **Board:** Seeed Studio XIAO SAMD21 (ARM Cortex-M0+, native USB).
-- **Sensor:** HC-SR04-style ultrasonic distance sensor, mounted above the well, measuring the
-  distance down to the water surface.
+Both boards are a **Seeed Studio XIAO SAMD21** (ARM Cortex-M0+, native USB). On every board the
+status LED lights while a command is being processed.
 
-Wiring (from the sketch):
+> ⚠️ **The XIAO is a 3.3 V part and its pins are not 5 V tolerant.** Its ADC reference is
+> `VDDANA` = 3.3 V. Any sensor module with an analog output must be powered from the **3V3** pad,
+> not 5V — see [docs/pump.md](docs/pump.md), where getting this wrong destroys the analog input.
+
+**Well sensor (`puit`)** — HC-SR04-style ultrasonic distance sensor, mounted above the well,
+measuring the distance down to the water surface.
 
 | Signal        | Pin           |
 |---------------|---------------|
@@ -23,7 +60,8 @@ Wiring (from the sketch):
 | Trigger (out) | `D8`          |
 | Status LED    | `LED_BUILTIN` |
 
-The LED lights while a command is being processed.
+**Pump sensor (`pump`)** — ZMPT101B AC voltage module across the pump's switched feed. Wiring,
+including the mistake that silently makes it useless, is in [docs/pump.md](docs/pump.md).
 
 ## Serial protocol contract
 
@@ -502,18 +540,31 @@ additive change — no `proto 3`.
 
 You flash this by connecting the XIAO directly to your computer over USB.
 
+> ⚠️ **Pick the environment before uploading.** The boards are physically identical and both
+> appear as the same kind of USB device, so nothing stops you flashing the pump firmware onto the
+> well sensor. `-e` is the only thing that decides which firmware gets written. Bare `pio run`
+> defaults to `puit` (set by `default_envs` in [platformio.ini](platformio.ini)); anything to do
+> with the pump board must say `-e pump` explicitly.
+
 1. **Install the PlatformIO IDE extension** in VSCode. Opening this folder will prompt you to
    install it (see [`.vscode/extensions.json`](.vscode/extensions.json)).
 2. **Open this folder** in VSCode. PlatformIO reads [`platformio.ini`](platformio.ini) and, on
    the first build, automatically downloads the SAMD (`atmelsam`) platform and toolchain — no
    manual "board core" install like the Arduino IDE requires.
-3. **Connect the XIAO** over USB.
-4. **Upload:** click the **→ (Upload)** button in the PlatformIO status bar, or run:
+3. **Connect the board** over USB — and be sure which one it is.
+4. **Upload:**
    ```
-   pio run -t upload
+   pio run -e puit -t upload      # well sensor
+   pio run -e pump -t upload      # pump sensor
    ```
-   To build without uploading, use **✓ (Build)** or `pio run`.
+   In the VSCode status bar, the environment selector sits next to the **→ (Upload)** button —
+   set it first, then upload. To build without uploading, drop `-t upload`:
+   ```
+   pio run -e puit -e pump        # build both, e.g. to check nothing broke
+   ```
 5. **Serial monitor** (to test): click the plug icon, or run `pio device monitor -b 9600`.
+   The boot banner tells you which firmware is actually on the board — the pump firmware
+   reports `"role":"pump"`.
 
 ### Making `pio` work in a terminal
 
@@ -548,15 +599,21 @@ installed, or to keep a known-good image alongside a release.
 ### 1. Build the image
 
 ```
-pio run
+pio run -e puit          # or -e pump
 ```
 
-(or the **✓ (Build)** button). Artifacts land in `.pio/build/seeed_xiao/`:
+(or the **✓ (Build)** button). Artifacts land in `.pio/build/<env>/` — so
+`.pio/build/puit/` and `.pio/build/pump/`, one directory per firmware:
 
 | File | What it is |
 | --- | --- |
 | `firmware.bin` | raw image, **linked for load address `0x2000`** |
 | `firmware.elf` | same code with symbols, for debugging |
+
+Both firmwares produce a file called `firmware.bin`, distinguished only by which directory it came
+out of. **Rename them when you copy them out** (`puit-2.1.0.bin`, `pump-1.0.0.bin`) — past that
+point nothing in the file says which board it belongs to, and flashing the wrong one gives a board
+that boots, answers, and is silently wrong.
 
 `0x2000` is the XIAO's application start: the bootloader owns `0x0000`–`0x1FFF`
 (`offset_address` in the board definition). The offset matters when flashing — see below.
@@ -570,7 +627,7 @@ The XIAO has a UF2 bootloader, so the friendliest artifact is a `.uf2` rather th
 Convert it with [`tools/bin2uf2.py`](tools/bin2uf2.py) (pure Python, no dependencies):
 
 ```
-python tools\bin2uf2.py .pio\build\seeed_xiao\firmware.bin .pio\build\seeed_xiao\firmware.uf2
+python tools\bin2uf2.py .pio\build\puit\firmware.bin .pio\build\puit\firmware.uf2
 ```
 
 Then:
@@ -604,13 +661,20 @@ bossac.exe -i -d --port=COM5 -U -i -e -w -v --offset=0x2000 firmware.bin -R
 ```
 arduino-cli core install Seeeduino:samd --additional-urls https://files.seeedstudio.com/arduino/package_seeeduino_boards_index.json
 arduino-cli lib install "ArduinoJson@7.4.3"
-arduino-cli compile -b Seeeduino:samd:seeed_XIAO_m0 --output-dir dist src\puit_sensor.ino
+arduino-cli compile -b Seeeduino:samd:seeed_XIAO_m0 --output-dir dist src\puit\puit_sensor.cpp
 ```
+
+Point it at the one `.cpp` you want; the per-firmware folders keep the sources from colliding the
+way two sketches in one directory would.
 
 Pin the same ArduinoJson version that [`platformio.ini`](platformio.ini) resolves (`^7` → 7.4.3
 at the time of writing) if you want an image comparable to the PlatformIO build.
 
 ## Testing after a flash
+
+> This checklist is for the **well sensor** (`puit`). The pump board has its own, including the
+> calibration step it cannot work without — see
+> [docs/pump.md](docs/pump.md#testing-after-a-flash).
 
 Open the serial monitor at 9600 baud and reset the board.
 
