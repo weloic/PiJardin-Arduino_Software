@@ -29,7 +29,9 @@ serial, documented once in [Serial protocol contract](#serial-protocol-contract)
 **not** share a command set, and `proto` is numbered **per firmware** — the pump board is at
 `proto 1` while the well sensor is at `proto 2`. There is nothing for a new board's contract to be
 version 2 *of*, so each starts at 1 and is versioned independently. Always read `role` from the
-boot banner (the pump firmware sends it) rather than inferring the board from a `proto` number.
+boot banner — **both** firmwares send it — rather than inferring the board from a `proto` number.
+`role` is not a literal in either sketch: it comes from `-DPIJARDIN_ROLE` in that environment's
+`build_flags`, so it cannot drift from the environment that built the firmware.
 
 > **Everything from [Serial protocol contract](#serial-protocol-contract) to the end of this file
 > describes the well sensor.** The pump board's contract, wiring and — importantly — its required
@@ -93,10 +95,11 @@ the Pi can correlate replies and ignore stray lines; sensor failures are reporte
   identify what it is talking to from any reply, not just the banner.
 - **Boot banner:** on reset the board prints one line and nothing else until commanded:
   ```json
-  {"type":"ready","proto":2,"fw":"2.1.0"}
+  {"type":"ready","proto":2,"fw":"2.1.0","role":"puit"}
   ```
   The Pi resets the board (DTR toggle) and waits for a line that parses to JSON with
-  `type == "ready"` before issuing commands.
+  `type == "ready"` before issuing commands. `role` says which board answered — check it
+  alongside `type`, and the Pi never has to care which `/dev/ttyACM*` it opened.
 - **Stateless:** the board keeps nothing between requests. Anything a request does not specify
   falls back to the documented default, and every response echoes the values actually used.
   Nothing to re-send after a reset, nothing to drift out of sync.
@@ -331,7 +334,7 @@ and `count('S') == n_stuck`. The character split is a refinement of the count, n
 these constants:
 
 ```json
-{"id":44,"type":"resp","proto":2,"status":"ok","fw":"2.1.0","uptime_ms":12345,
+{"id":44,"type":"resp","proto":2,"status":"ok","fw":"2.1.0","role":"puit","uptime_ms":12345,
  "max_n":25,"n_default":10,"timeout_default_us":45000,"ack_timeout_default_us":50000,
  "min_cm_default":5,"max_cm_default":500,"line_max":192}
 ```
@@ -567,7 +570,11 @@ You flash this by connecting the XIAO directly to your computer over USB.
    "board core" install like the Arduino IDE requires. The two envs pull **different** toolchains
    (`atmelsam` for `puit`, an RP2040 one for `pump`), so expect the first `-e pump` build to take
    several minutes and need network.
-3. **Connect the board** over USB — and be sure which one it is.
+3. **Connect the board** over USB — and be sure which one it is. `pio device list` names it:
+   each firmware sets its own USB product string, so the boards show up as **PiJardin Puit**
+   and **PiJardin Pompe** rather than two identical `Seeeduino XIAO` / `XIAO RP2040` entries.
+   (Windows caches that name per VID+PID, so Device Manager may lag a firmware change until
+   you uninstall the device and replug; `pio device list` reads the live descriptor.)
 4. **Upload:**
    ```
    pio run -e puit -t upload      # well sensor
@@ -579,8 +586,10 @@ You flash this by connecting the XIAO directly to your computer over USB.
    pio run -e puit -e pump        # build both, e.g. to check nothing broke
    ```
 5. **Serial monitor** (to test): click the plug icon, or run `pio device monitor -b 9600`.
-   The boot banner tells you which firmware is actually on the board — the pump firmware
-   reports `"role":"pump"`.
+   The boot banner confirms which firmware is actually on the board: `"role":"puit"` or
+   `"role":"pump"`. The USB product string in step 3 says what the board *claims* to be; the
+   banner's `role` is what the firmware on it actually is. They agree unless you crossed a
+   flash — which is exactly the mistake worth catching here.
 
 ### Making `pio` work in a terminal
 
@@ -694,8 +703,8 @@ at the time of writing) if you want an image comparable to the PlatformIO build.
 
 Open the serial monitor at 9600 baud and reset the board.
 
-1. **Banner** → `{"type":"ready","proto":2,"fw":"2.1.0"}`.
-2. `{"id":1,"cmd":"status"}` → `ok` with `fw`/`uptime_ms` and the limits
+1. **Banner** → `{"type":"ready","proto":2,"fw":"2.1.0","role":"puit"}`.
+2. `{"id":1,"cmd":"status"}` → `ok` with `fw`/`role`/`uptime_ms` and the limits
    (`max_n:25`, `n_default:10`, `ack_timeout_default_us:50000`, `line_max:192`).
 3. `{"id":2,"cmd":"read_puit"}` → `ok` with a numeric `value` in cm, the four counts summing to `n`,
    and `min`/`max`/`spread`. **Check `value ≈ pulse_us / 58.24` by hand** — that is the regression

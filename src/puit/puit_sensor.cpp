@@ -37,6 +37,16 @@
 #define FW_VERSION "2.1.0"
 #define PROTO_VERSION 2
 
+// Board role, injected per environment by platformio.ini (-DPIJARDIN_ROLE). It rides on
+// the boot banner and the status response so the Pi can tell the two boards apart from
+// the data itself, rather than guessing from a USB VID or a proto number. Deliberately
+// not a literal here: a copy in the source could disagree with the environment that
+// built it, and a firmware that lies about its role is worse than one that will not
+// compile.
+#ifndef PIJARDIN_ROLE
+#error "PIJARDIN_ROLE is not defined -- set it in this environment's build_flags in platformio.ini"
+#endif
+
 // --- Defaults and safe bounds for the per-request parameters -----------------
 #define DEFAULT_N 10
 #define MAX_N 25                     // sizes the per-ping arrays below
@@ -198,6 +208,7 @@ void setup() {
   doc["type"] = "ready";
   doc["proto"] = PROTO_VERSION;
   doc["fw"] = FW_VERSION;
+  doc["role"] = PIJARDIN_ROLE;
   serializeJson(doc, Serial);
   Serial.println();
 }
@@ -380,6 +391,7 @@ void handleStatus(JsonVariantConst id) {
   beginResponse(doc, id);
   doc["status"] = "ok";
   doc["fw"] = FW_VERSION;
+  doc["role"] = PIJARDIN_ROLE;
   doc["uptime_ms"] = millis();
 
   // Limits and defaults, so the Pi can discover them instead of hardcoding a
