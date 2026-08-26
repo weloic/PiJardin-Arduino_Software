@@ -34,7 +34,7 @@
 #define LEDPIN LED_BUILTIN
 
 // --- Protocol / firmware identity -------------------------------------------
-#define FW_VERSION "2.1.0"
+#define FW_VERSION "2.2.0"
 #define PROTO_VERSION 2
 
 // Board role, injected per environment by platformio.ini (-DPIJARDIN_ROLE). It rides on
