@@ -95,7 +95,7 @@ the Pi can correlate replies and ignore stray lines; sensor failures are reporte
   identify what it is talking to from any reply, not just the banner.
 - **Boot banner:** on reset the board prints one line and nothing else until commanded:
   ```json
-  {"type":"ready","proto":2,"fw":"2.1.0","role":"puit"}
+  {"type":"ready","proto":2,"fw":"2.2.0","role":"puit"}
   ```
   The Pi resets the board (DTR toggle) and waits for a line that parses to JSON with
   `type == "ready"` before issuing commands. `role` says which board answered — check it
@@ -334,7 +334,7 @@ and `count('S') == n_stuck`. The character split is a refinement of the count, n
 these constants:
 
 ```json
-{"id":44,"type":"resp","proto":2,"status":"ok","fw":"2.1.0","role":"puit","uptime_ms":12345,
+{"id":44,"type":"resp","proto":2,"status":"ok","fw":"2.2.0","role":"puit","uptime_ms":12345,
  "max_n":25,"n_default":10,"timeout_default_us":45000,"ack_timeout_default_us":50000,
  "min_cm_default":5,"max_cm_default":500,"line_max":192}
 ```
@@ -636,7 +636,7 @@ pio run -e puit          # or -e pump
 | `firmware.elf` | same code with symbols, for debugging |
 
 Both firmwares produce a file called `firmware.bin`, distinguished only by which directory it came
-out of. **Rename them when you copy them out** (`puit-2.1.0.bin`, `pump-1.0.0.bin`) — past that
+out of. **Rename them when you copy them out** (`puit-2.2.0.bin`, `pump-1.0.0.bin`) — past that
 point nothing in the file says which board it belongs to, and flashing the wrong one gives a board
 that boots, answers, and is silently wrong.
 
@@ -703,7 +703,7 @@ at the time of writing) if you want an image comparable to the PlatformIO build.
 
 Open the serial monitor at 9600 baud and reset the board.
 
-1. **Banner** → `{"type":"ready","proto":2,"fw":"2.1.0","role":"puit"}`.
+1. **Banner** → `{"type":"ready","proto":2,"fw":"2.2.0","role":"puit"}`.
 2. `{"id":1,"cmd":"status"}` → `ok` with `fw`/`role`/`uptime_ms` and the limits
    (`max_n:25`, `n_default:10`, `ack_timeout_default_us:50000`, `line_max:192`).
 3. `{"id":2,"cmd":"read_puit"}` → `ok` with a numeric `value` in cm, the four counts summing to `n`,
