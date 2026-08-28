@@ -48,12 +48,21 @@
 
 // ZMPT101B analog out. On the XIAO RP2040 A0 is GPIO26 = ADC0.
 //
-// POWER THE MODULE FROM 3V3, NOT 5V. The ZMPT101B biases its output at Vcc/2 and
-// swings around it, so on 5 V it idles at 2.5 V and peaks near 5 V. The RP2040's
-// GPIOs are not 5 V tolerant and its ADC reference is 3.3 V, so that arrangement
-// clips every reading and damages the pin. On 3V3 the module idles near
-// mid-scale (~1.65 V, ~2048 counts) and cannot overshoot the pin. Unchanged from
-// the SAMD21 version: different chip, same 3.3 V limit, same reason.
+// POWER THE MODULE FROM 5V, AND DIVIDE ITS OUTPUT 2:1 BEFORE THIS PIN.
+//
+// Both halves are required, for opposite reasons. The stock ZMPT101B is
+// specified for 5-30 V and amplifies through an LM358, which cannot drive its
+// output within ~1.3 V of its positive rail -- run from 3V3 it flattens the top
+// of the wave at ~2.0 V while the bottom swings freely, and n_clipped never sees
+// it because that is nowhere near the ADC rails. Measured at 3V3 on real
+// hardware: bias 2032, max 2476 (+444), min 1480 (-552), rms 394 where a clean
+// sine of that peak gives 352. But on 5 V the module idles at 2.5 V and peaks
+// near 5 V, and the RP2040's GPIOs are not 5 V tolerant -- so two 10k resistors
+// halve it, keeping this pin under ~2.5 V with the LM358 on its proper rail.
+//
+// The divider puts the idle level near 1.25 V (~1550 counts) instead of
+// mid-scale. Nothing here needs adjusting for that: the bias is measured, not
+// assumed (see analyse()), and 1550 sits inside the default plausibility window.
 #define VPIN A0
 
 // GPIO17, the red user LED. THE XIAO RP2040'S USER LEDS ARE ACTIVE LOW -- the
@@ -96,14 +105,19 @@
 // real signal at any usable gain sits in the hundreds, so this only ever gates
 // out traces that are pure noise.
 //
-// Worth re-checking on this board specifically. The RP2040's SAR ADC has a
-// documented differential-nonlinearity problem -- a handful of codes it will
-// never return, which shows up as extra counts of apparent noise on a quiet
-// input. If the measured pump-off RMS comes back near or above this value the
-// guard is not guarding, and freq_hz goes back to being derived from noise.
-// Measure the real floor during calibration and raise this to ~3x it if needed;
-// tools/pump_tune.py prints the figure you need.
-#define FREQ_MIN_RMS 10.0f
+// Raised from the original 10.0 on 2026-08-28, and this one is measured too. The
+// RP2040's SAR ADC has a documented differential-nonlinearity problem -- codes it
+// will never return -- which shows up as extra apparent noise on a quiet input,
+// and this installation's pump-off floor came in at 8.4-14.2 counts. Above the
+// old 10.0 guard, so the board was deriving a frequency from that noise and
+// reporting it with a straight face: 274, 290, 307, 341, 425 Hz across
+// consecutive windows. Numbers that wander like that are not a frequency.
+//
+// 40.0 is ~3x the observed floor. It leaves the running signal (199 counts)
+// untouched and returns an honest freq_hz of 0 when the pump is stopped.
+// Re-measure it if the installation changes; tools/pump_tune.py prints the
+// figure and now recommends the value directly.
+#define FREQ_MIN_RMS 40.0f
 
 // --- Sampling window ---------------------------------------------------------
 // Samples are stored rather than accumulated on the fly, so the buffer is what
@@ -133,12 +147,23 @@
 // RMS in ADC counts, not volts, because counts are what the board can actually
 // observe: the ZMPT101B's output amplitude is set by the multi-turn pot on the
 // module, so there is no factory relationship between counts and volts to
-// assume. THESE TWO DEFAULTS ARE PLACEHOLDERS. Run `sampling` against the real
-// installation with the pump off and then on, and set them from the two RMS
-// figures you get back -- see the calibration section in README.md. Left
-// uncalibrated they will misreport.
-#define DEFAULT_ON_COUNTS 200.0f
-#define DEFAULT_OFF_COUNTS 80.0f
+// assume. These two are MEASURED, not guessed -- calibrated 2026-08-28 against
+// the real installation with tools/pump_tune.py:
+//
+//   floor  12.93 counts (worst of 5, pump stopped)   -> off_counts 2.7x clear
+//   signal 199.20 counts (worst of 5, pump running)  -> on_counts  2.8x clear
+//   separation 15.4x; bias 2052; waveform rms/peak 0.703 (a sine is 0.707)
+//
+// Placed geometrically between the two states rather than by the 5x / div-3
+// rule, which needs about 20x separation before it leaves a usable gap -- at
+// 15.4x it put the two thresholds 1.7 counts apart. The band between them is the
+// "uncertain" verdict and it does real work: a 200 ms window that straddles the
+// contactor lands in it, which is exactly the case the board must not guess at.
+//
+// Re-run the calibration if the pot moves, the module is replaced, or anything
+// changes on that circuit -- see docs/pump.md.
+#define DEFAULT_ON_COUNTS 71.1f
+#define DEFAULT_OFF_COUNTS 35.5f
 
 // --- Sensor plausibility -----------------------------------------------------
 // A live module idles near mid-scale whatever the pump is doing, because the

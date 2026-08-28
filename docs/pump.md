@@ -23,14 +23,71 @@ See the repo [README](../README.md) for the shared NDJSON envelope, the toolchai
 
 ## ⚠️ Two ways to destroy this, both silent
 
-### 1. Powering the module from 5 V
+### 1. Connecting `OUT` straight to `A0`
 
-**Power the ZMPT101B from the XIAO's `3V3` pad. Not `5V`.**
+**Power the ZMPT101B from `5V`, and divide its output 2:1 before it reaches `A0`.**
 
-The module biases its analog output at Vcc/2 and swings around it, so on 5 V it idles at 2.5 V and
-peaks near 5 V. The RP2040's GPIOs are **not 5 V tolerant** and its ADC reference is 3.3 V. That
-arrangement clips every reading *and* stresses the pin past its rating. On 3V3 the module idles near
-mid-scale (~1.65 V, ~2048 counts) and physically cannot overshoot.
+```
+  ZMPT101B VCC ──── XIAO 5V
+  ZMPT101B GND ──── XIAO GND
+  ZMPT101B OUT ──┬─ 10 kΩ ──┬── XIAO A0
+                            │
+                          10 kΩ
+                            │
+                           GND
+```
+
+Both halves of that matter, for opposite reasons, and **neither can be dropped**:
+
+**Why not 3V3 — the module cannot do it.** The stock module is specified for **+5 V to +30 V** and
+amplifies through an **LM358**, which cannot drive its output closer than about 1.3 V to its
+positive rail. On 3V3 it biases at ~1.65 V but can only reach ~2.0 V, so the top of the wave is
+flattened while the bottom swings freely. Measured on this project's hardware at 3V3:
+
+```
+bias 2032    max 2476 (+444)    min 1480 (-552)    rms 394    n_clipped 0
+```
+
+A clean sine of that peak would read `rms` 352; 394 means the wave is squared off. **`n_clipped`
+stayed 0 throughout**, because the flattening happens at 2476 counts and that check only looks for
+the 0/4095 rails. Nothing in the raw numbers gives this away except the ±20 % asymmetry about the
+bias — `tools/pump_tune.py` now tests for exactly that and names it.
+
+**Why the divider — the board cannot take 5 V.** On a 5 V supply the module idles at 2.5 V and peaks
+near 5 V. The RP2040's GPIOs are **not 5 V tolerant** and its ADC reference is 3.3 V, so `OUT`
+straight to `A0` clips every reading *and* stresses the pin past its rating. Two 10 kΩ resistors
+halve it: `A0` never exceeds ~2.5 V, and the wave is symmetric because the LM358 now has its
+specified rail.
+
+The divider moves the idle level to ~1.25 V (~1550 counts) rather than mid-scale. **That is fine and
+needs no configuration** — the firmware measures the bias rather than assuming 2048, and 1550 sits
+comfortably inside the default plausibility window of 1024–3072.
+
+> A ZMPT101B variant built around a rail-to-rail op-amp will run happily at 3V3 with no divider.
+> Check what is actually on your module before assuming; the LM358 is the common one.
+
+#### Running at 3V3 anyway
+
+For **on/off detection only**, 3V3 with no divider does work, and it needs no extra components. The
+distortion does not change the verdict: a running pump still reads hundreds of counts RMS against a
+handful when stopped. What you give up is a true RMS — `vrms` would be wrong, and the compression
+drifts with the 3V3 rail and with temperature.
+
+The constraint is that the LM358's ceiling, not the ADC rail, sets the maximum usable amplitude. On
+the hardware measured above the ceiling was ~2476 counts with the bias at 2032, leaving only ~440
+counts of positive swing against 2032 below. **Set the gain from the ceiling, not the rail:**
+
+```
+python tools/pump_tune.py plot --ceiling 2450
+```
+
+`--ceiling` tells the tool the real limit so its gain advice is measured against that instead of
+4095. Without it, it reports over a thousand counts of headroom the signal cannot use and
+recommends raising a gain that is already too high.
+
+Turn the pot **down** until the asymmetry warning clears and the margin reads `good`. Aim for the
+middle of the band rather than the edge — the ceiling moves with supply and temperature, and a pot
+set right against it will start clipping in a warm plant room.
 
 ### 2. Wiring it across the wrong side of the contactor
 
@@ -59,8 +116,8 @@ reading actually drops.
 
 | Signal | Pin | Note |
 | --- | --- | --- |
-| ZMPT101B `OUT` | `A0` | GPIO26 = ADC0 on the RP2040 |
-| ZMPT101B `VCC` | `3V3` | **not 5V** — see above |
+| ZMPT101B `OUT` | `A0` | GPIO26 = ADC0 — **via a 2:1 divider**, see above |
+| ZMPT101B `VCC` | `5V` | the LM358 will not work on 3V3 — see above |
 | ZMPT101B `GND` | `GND` | |
 | Status LED | `LED_BUILTIN` | GPIO17, the red LED; lit while a command is served |
 
@@ -203,13 +260,29 @@ the same thing by hand; use it if you would rather not install pyserial.
    ```
    The gap between them is the `"uncertain"` band, and it is doing real work — make it wide. Both
    can be overridden per request, so test candidate values before editing the source.
-5. **Check the noise floor against `FREQ_MIN_RMS`** (10.0 in the source). That constant is what
+5. **Check whether the pump-off floor is noise or coupled mains.** If the off-state windows report
+   a `freq_hz` at the mains frequency, the floor is not ADC noise — it is mains leaking through with
+   the contactor open, typically an RC snubber or indicator lamp across the contacts, or capacitive
+   pickup between the sense wires and the feed. Measured on this installation: **26.3 counts at
+   50.12 Hz**, against 204 counts running — a fixed 7.8× separation.
+
+   The consequence is counter-intuitive and worth stating plainly: **raising the gain cannot widen
+   that ratio.** Coupled mains enters ahead of the module's amplifier, so the pot multiplies it by
+   exactly the same factor as the signal. Turning the gain up only walks the waveform back into
+   clipping. The separation is a property of the installation; to improve it, reduce the coupling.
+   `tools/pump_tune.py calibrate` now detects this and says so instead of suggesting more gain.
+
+   A 7.8× separation is comfortably workable — the geometric thresholds land ~2× clear of each
+   state — but it does mean "off" is not zero. If the coupling ever grows past `off_counts`, the
+   board starts reporting `uncertain` and eventually a false `on`, so re-run `calibrate` if the
+   circuit changes.
+6. **Check the floor against `FREQ_MIN_RMS`** (10.0 in the source). That constant is what
    stops a frequency being derived from pure noise. The RP2040's SAR ADC has a documented
    differential-nonlinearity problem — a few codes it will never return — which shows up as extra
    apparent noise on a quiet input, so this board may sit higher than a SAMD21 would. If the
    pump-off `rms_counts` from step 2 is anywhere near 10, raise `FREQ_MIN_RMS` to about 3× it;
    otherwise the guard is not guarding and `freq_hz` goes back to being invented from noise.
-6. **Verify both states** with `read_pump`, then rebuild with the values baked in.
+7. **Verify both states** with `read_pump`, then rebuild with the values baked in.
 
 Record the numbers you measured in the commit message. The well sensor's `ack_timeout_us` comment
 is the precedent: a constant that was guessed and then measured, with the measurement written down,

@@ -28,6 +28,7 @@ for a banner that already went out before it got here.
 """
 import argparse
 import json
+import os
 import statistics
 import sys
 import time
@@ -49,6 +50,20 @@ ADC_MAX = 4095
 # catches a wrong guess with a clear message rather than a confusing reading.
 BOARD_VIDS = (0x2E8A, 0x2886)  # Raspberry Pi, Seeed
 MID_SCALE = 2048
+
+# Mirrors FREQ_MIN_RMS in src/pump/pump_sensor.cpp. Kept here only to tell the
+# user when the firmware's value no longer suits their installation -- the board
+# does not report it, so this copy can drift; check it if the advice looks odd.
+FREQ_MIN_RMS_DEFAULT = 10.0
+
+# The uncertain band must span at least this ratio for the 5x / div-3 rule to be
+# worth using. Below it the rule degenerates: it needs roughly 15x separation
+# before `signal/3` clears `5 x floor` at all, so just past that point the two
+# thresholds come out almost equal. Measured: floor 12.93, signal 199.20 (15.4x)
+# produced off=64.7 and on=66.4 -- a 1.7-count band, which is a single threshold
+# wearing a disguise. The `on <= off` inversion test does not catch it, because
+# 66.4 really is greater than 64.7.
+MIN_BAND_RATIO = 1.6
 
 
 class Board:
@@ -145,6 +160,67 @@ def check(resp, mains_hz):
             f"rms_counts understates the real signal until this is 0."
         )
 
+    # Clipping that happens BELOW the ADC rails, which n_clipped cannot see.
+    #
+    # The stock ZMPT101B is specified for 5-30 V and its LM358 cannot drive its
+    # output closer than ~1.3 V to its positive rail. Run from 3V3 it therefore
+    # flattens the top of the wave at ~2.0 V (~2480 counts) while the bottom half
+    # swings freely -- a distorted reading with n_clipped:0 and both rails
+    # untouched. Measured on this project's hardware: bias 2032, max 2476
+    # (+444), min 1480 (-552), rms 394 where a clean sine of that peak would
+    # give 352.
+    #
+    # Two independent symptoms, because either alone has innocent explanations:
+    # mains itself is often slightly flat-topped (odd harmonics from rectifier
+    # loads), but that distorts both halves EQUALLY, so asymmetry is what
+    # separates an op-amp running out of headroom from an ugly grid.
+    rms = resp.get("rms_counts", 0)
+    lo, hi = resp.get("min_counts", 0), resp.get("max_counts", 0)
+    pos, neg = hi - bias, bias - lo
+    peak = (hi - lo) / 2.0
+    if rms > 50 and peak > 0 and max(pos, neg) > 0:
+        asym = abs(pos - neg) / max(pos, neg)
+        fullness = rms / peak  # 0.707 for a sine, 1.0 for a square
+        if asym > 0.15 and fullness > 0.76:
+            volts = hi / 4095.0 * 3.3
+            target = int(MID_SCALE + 0.8 * (hi - MID_SCALE))
+            problems.append(
+                f"ASYMMETRIC CLIPPING: +{pos:.0f}/-{neg:.0f} counts about the bias "
+                f"({asym * 100:.0f}% lopsided) and rms/peak {fullness:.2f} vs 0.707 "
+                f"for a sine. The top is being flattened at {hi} counts (~{volts:.2f} V), "
+                f"well below the ADC rail -- so n_clipped cannot see it.\n"
+                f"      This is the LM358 out of headroom on a 3.3 V supply.\n"
+                f"      TURNING THE POT: a multi-turn pot gives no clue which way is "
+                f"'down', and max_counts is PINNED at the ceiling so it will not move "
+                f"whichever way you turn. Judge by these instead:\n"
+                f"        rms_counts must FALL   (rising = wrong way)\n"
+                f"        bias_counts must climb back toward {MID_SCALE} "
+                f"(now {bias:.0f}; it sags because the clipped top drags the mean down)\n"
+                f"      Aim for max_counts near {target} with this warning gone. Watch it "
+                f"live while turning:  pump_tune.py watch\n"
+                f"      Or fix it properly: VCC to 5V, OUT divided 2:1 -- see docs/pump.md."
+            )
+        elif asym > 0.15 and fullness > 0.72:
+            problems.append(
+                f"waveform is lopsided about the bias: +{pos:.0f}/-{neg:.0f} counts, "
+                f"and rms/peak {fullness:.2f} is starting to climb above the 0.707 of a "
+                f"sine. Approaching the flattening described in docs/pump.md -- do not "
+                f"raise the gain further."
+            )
+        # No warning for asymmetry with fullness at or below ~0.72. A real mains
+        # waveform is not a textbook sine -- harmonics from every rectifier on the
+        # circuit lean it, commonly 15-20%, and NO gain setting removes that.
+        #
+        # An earlier version warned on asymmetry alone and told the user to
+        # "reduce the gain until the two swings match", which is unreachable
+        # advice: measured on this installation, winding the gain down took rms
+        # 262 -> 206 while the lean went 15% -> 18%. Two things separate the
+        # benign case from clipping, and both were visible in that data:
+        #   - direction: flattening SUPPRESSES one side, so the clipped side is
+        #     the SMALLER excursion. Here the larger side was the positive one.
+        #   - fullness: flattening pushes rms/peak ABOVE 0.707 (0.81 when this
+        #     module was truly clipping). Benign asymmetry sits at or below it.
+
     if resp.get("truncated"):
         problems.append(
             f"window truncated to {resp.get('cycles_eff', 0):.1f} of "
@@ -162,9 +238,21 @@ def check(resp, mains_hz):
     # Only meaningful once there is a signal at all; 0 is the honest pump-off result.
     freq = resp.get("freq_hz", 0)
     if resp.get("rms_counts", 0) > 50 and freq > 0 and abs(freq - mains_hz) > 2.0:
+        # Two very different causes, and one reading cannot separate them, so
+        # name both rather than asserting the alarming one. A window that
+        # straddles the contactor opening or closing is part quiet and part
+        # mains, which yields an in-between RMS and a frequency that is an
+        # artefact of the join -- measured on this installation: 52 counts at
+        # 31 Hz and 149 counts at 43 Hz, each immediately before a clean state
+        # change either side. That is the sampling window doing its job, not a
+        # fault. Persistent pickup shows the same shape but does NOT resolve
+        # into a clean on/off on the next reading.
         problems.append(
-            f"freq_hz {freq:.2f} is not {mains_hz:.0f} Hz -- this looks like induced "
-            f"hum or pickup, not the pump's feed"
+            f"freq_hz {freq:.2f} is not {mains_hz:.0f} Hz. If the readings either side "
+            f"are clean on/off, this window simply straddled a pump transition -- "
+            f"expected, and what the 'uncertain' state exists for. If it persists "
+            f"while the pump is steady, it is induced hum or pickup rather than the "
+            f"pump's feed."
         )
 
     return problems
@@ -189,7 +277,7 @@ def summarise(resp, mains_hz, prefix=""):
         print(f"    ! {p}")
 
 
-def ascii_plot(samples, height=19, width=76):
+def ascii_plot(samples, bias=None, ceiling=None, height=19, width=76):
     """Min/max envelope plot of the waveform, one column per bucket.
 
     Min/max per bucket rather than every k-th sample on purpose: decimating a
@@ -235,16 +323,72 @@ def ascii_plot(samples, height=19, width=76):
     # Rails are absolute, so say so regardless of the autoscale above.
     if lo <= 4 or hi >= ADC_MAX - 4:
         print("  ! touching a rail -- the peaks are cut off; turn the pot DOWN")
-    # Target headroom mirrors the max_counts 3000-3800 window in docs/pump.md:
-    # a clear signal that still cannot clip on a slightly high mains day.
-    headroom = min(lo, ADC_MAX - hi)
-    if headroom < 250:
-        verdict = "too little -- turn the pot DOWN"
-    elif headroom > 1100:
-        verdict = "signal is small -- turn the pot UP"
+    # Gain advice, but ONLY once we know the ADC rails are the real limit.
+    #
+    # "Lots of headroom, turn the pot up" is exactly wrong when the ceiling is
+    # the op-amp rather than the ADC: the module is already flattening the top
+    # of the wave hundreds of counts below the rail, and more gain flattens it
+    # further while this measure keeps reporting room to spare. Measured on a
+    # ZMPT101B at 3V3: 1480 counts of apparent headroom while the positive peaks
+    # were already compressed 20%. So say nothing about gain until the waveform
+    # is symmetric enough to trust the rails as the limit.
+    lopsided = False
+    if bias is not None:
+        pos, neg = hi - bias, bias - lo
+        if max(pos, neg) > 0:
+            lopsided = abs(pos - neg) / max(pos, neg) > 0.15
+
+    if ceiling is not None:
+        # --ceiling declares that something below the ADC rail is the real limit,
+        # which is the situation when an LM358 module is deliberately run at 3V3
+        # (see docs/pump.md). Without it this function measures room that the
+        # signal cannot actually use and advises raising a gain that is already
+        # too high -- the exact mistake that produced the flattened capture in
+        # the docs. Margins here are small by nature, hence the tighter bands.
+        margin = min(ceiling - hi, lo)
+        if margin < 0 and lopsided:
+            # Once the top is hard-clipped, `hi` sits ON the ceiling and stops
+            # responding to the pot, so this margin freezes at a small negative
+            # number and reports the same thing however far the gain is wound --
+            # measured: -11, -11, -12, -12 across four turns that tripled the
+            # RMS. Saying "turn it down" against a frozen number reads as "the
+            # pot does nothing". Point at the figures that do still move.
+            print(f"  max_counts ({hi}) is PINNED at the ceiling -- this margin cannot")
+            print(f"  improve, and does not move however far you turn the pot. Judge by")
+            print(f"  rms_counts and bias_counts instead; see the warning above.")
+            return
+        if margin < 0:
+            verdict = f"OVER the {ceiling}-count ceiling -- reduce the gain"
+        elif margin < 50:
+            verdict = "too tight; drift will clip it -- turn the pot DOWN"
+        elif margin > 250:
+            verdict = "room to raise the gain a little"
+        else:
+            verdict = "good"
+        print(f"  margin to the declared {ceiling}-count ceiling: {margin} counts ({verdict})")
+    elif lopsided:
+        # Report, do not prescribe. Whether a lean is benign harmonic content or
+        # the onset of flattening needs the RMS, which check() has and this does
+        # not -- so this states the measurement and leaves the diagnosis there.
+        # Two functions independently deciding what the user should do to the pot
+        # is how this tool ended up printing contradictory instructions.
+        pos, neg = hi - bias, bias - lo
+        print(f"  swing about the bias: +{pos:.0f} / -{neg:.0f} counts "
+              f"({abs(pos - neg) / max(pos, neg) * 100:.0f}% lopsided) -- see any")
+        print(f"  warning above for whether that matters.")
+        print(f"  {min(lo, ADC_MAX - hi)} counts to the nearest ADC rail. If this module")
+        print(f"  cannot reach the rail (an LM358 at 3V3 tops out near 2460), that figure")
+        print(f"  is not a gain guide -- re-run with --ceiling COUNTS for advice against")
+        print(f"  the real limit.")
     else:
-        verdict = "good"
-    print(f"  headroom to the nearest rail: {headroom} counts ({verdict})")
+        headroom = min(lo, ADC_MAX - hi)
+        if headroom < 250:
+            verdict = "too little -- turn the pot DOWN"
+        elif headroom > 1100:
+            verdict = "signal is small -- turn the pot UP"
+        else:
+            verdict = "good"
+        print(f"  headroom to the nearest rail: {headroom} counts ({verdict})")
 
 
 # --- Commands -----------------------------------------------------------------
@@ -266,7 +410,8 @@ def cmd_plot(board, args):
     resp = board.request("sampling", dump_n=args.dump_n, **sample_args(args))
     summarise(resp, args.mains_hz)
     print()
-    ascii_plot(resp.get("samples", []))
+    ascii_plot(resp.get("samples", []), bias=resp.get("bias_counts"),
+               ceiling=args.ceiling)
 
 
 def cmd_watch(board, args):
@@ -281,8 +426,13 @@ def cmd_watch(board, args):
 
 
 def collect(board, args, n, label):
-    """Take n windows and return their rms figures, printing each as it lands."""
-    rms = []
+    """Take n windows and return the full responses, printing each as it lands.
+
+    The whole response rather than just the RMS: the frequency of the pump-OFF
+    trace decides what the floor actually is, and therefore whether the gain can
+    do anything about it. See cmd_calibrate.
+    """
+    out = []
     for i in range(n):
         resp = board.request("sampling", dump_n=0, **sample_args(args))
         if resp.get("status") == "error":
@@ -290,10 +440,30 @@ def collect(board, args, n, label):
             for p in check(resp, args.mains_hz):
                 print(f"    ! {p}")
             sys.exit(1)
-        rms.append(resp["rms_counts"])
+        out.append(resp)
         summarise(resp, args.mains_hz, prefix=f"  [{label} {i+1}/{n}] ")
         time.sleep(0.2)
-    return rms
+    return out
+
+
+def floor_is_coupled_mains(off_resps, mains_hz):
+    """True if the pump-off floor is mains leaking through, not ADC noise.
+
+    The distinction decides whether more gain can widen the margin. ADC noise is
+    generated after the amplifier, so turning the gain up lifts the signal and
+    leaves the noise where it is -- the ratio improves. Mains coupled in ahead of
+    the amplifier (a contactor snubber, an indicator lamp, capacitive pickup
+    between conductors) is amplified by exactly the same factor as the signal, so
+    the ratio is fixed by the installation and no pot setting changes it.
+
+    They are told apart by frequency: the firmware only derives one above
+    FREQ_MIN_RMS and never guesses, so an off-state trace reporting the mains
+    frequency has real mains in it. Measured on this installation: pump off,
+    rms 26.3 counts, freq 50.12 Hz across all five windows.
+    """
+    hits = sum(1 for r in off_resps
+               if abs(r.get("freq_hz", 0.0) - mains_hz) < 2.0)
+    return hits > len(off_resps) / 2
 
 
 def cmd_calibrate(board, args):
@@ -303,18 +473,48 @@ def cmd_calibrate(board, args):
     print("WORST case seen, not the average -- the point is a margin that holds.\n")
 
     input("1. Switch the pump OFF, wait for it to settle, then press Enter... ")
-    off = collect(board, args, n, "off")
+    off_resps = collect(board, args, n, "off")
 
     print()
     input("2. Switch the pump ON, wait for it to settle, then press Enter... ")
-    on = collect(board, args, n, "on")
+    on_resps = collect(board, args, n, "on")
 
-    rms_off = max(off)   # worst-case noise floor
+    off = [r["rms_counts"] for r in off_resps]
+    on = [r["rms_counts"] for r in on_resps]
+    coupled = floor_is_coupled_mains(off_resps, args.mains_hz)
+
+    rms_off = max(off)   # worst-case floor
     rms_on = min(on)     # worst-case signal
-    print(f"\n  noise floor (worst of {n}): {rms_off:.2f} counts  "
+    print(f"\n  floor  (worst of {n}): {rms_off:.2f} counts  "
           f"[median {statistics.median(off):.2f}]")
-    print(f"  signal      (worst of {n}): {rms_on:.2f} counts  "
+    print(f"  signal (worst of {n}): {rms_on:.2f} counts  "
           f"[median {statistics.median(on):.2f}]")
+    print(f"  separation: {rms_on / rms_off:.1f}x")
+    if coupled:
+        print(f"  the floor carries mains at ~{args.mains_hz:.0f} Hz, so it is coupling")
+        print(f"  through the installation rather than ADC noise -- see below")
+
+    # FREQ_MIN_RMS decides whether the firmware derives a frequency at all. A
+    # floor above it means the board reports one for a STOPPED pump, and unless
+    # that floor is coupled mains the number is derived from noise. Measured
+    # here: floor 12.9 against the 10.0 default, yielding 307/425/393/328/341 Hz
+    # across five windows -- wandering like that is the signature of no real
+    # periodicity, which is exactly what this guard exists to suppress.
+    if rms_off >= FREQ_MIN_RMS_DEFAULT:
+        want = max(20, int(round(rms_off * 3 / 10.0)) * 10)
+        freqs = ", ".join(f"{r.get('freq_hz', 0):.0f}" for r in off_resps)
+        print(f"\n  ! FREQ_MIN_RMS in the firmware is {FREQ_MIN_RMS_DEFAULT:.1f}, BELOW this "
+              f"floor of {rms_off:.2f}, so the")
+        if coupled:
+            print(f"  ! board reports a frequency with the pump stopped. Here that is real "
+                  f"coupled\n  ! mains rather than fiction, so it is informative -- but "
+                  f"raising FREQ_MIN_RMS to\n  ! {want}.0f would keep the off state quiet if "
+                  f"you would rather it said nothing.")
+        else:
+            print(f"  ! board derives one from NOISE with the pump stopped: {freqs} Hz across "
+                  f"the\n  ! five windows. Wandering like that means there is no real "
+                  f"periodicity there.\n  ! Set FREQ_MIN_RMS to {want}.0f in "
+                  f"src/pump/pump_sensor.cpp (~3x this floor).")
 
     if rms_on <= rms_off * 3:
         print("\n  ! The two states are not separated. Either the pot gain is far too low,")
@@ -325,25 +525,54 @@ def cmd_calibrate(board, args):
 
     off_counts = max(5.0 * rms_off, 20.0)
     on_counts = rms_on / 3.0
-    if on_counts <= off_counts:
+    if on_counts < off_counts * MIN_BAND_RATIO:
         # Separated, but not by enough for the 5x/÷3 rule to leave a gap. Split the
         # difference geometrically rather than emitting an inverted pair, which the
         # firmware would reject as bad_param anyway.
         mid = (rms_off * rms_on) ** 0.5
         off_counts, on_counts = mid * 0.7, mid * 1.4
-        print("\n  ! Margin is tight; thresholds placed geometrically between the states.")
-        print("  ! Raise the gain pot and re-run to get a wider uncertain band.")
+        print("\n  ! Margin is tight for the 5x/div-3 rule; thresholds placed")
+        print(f"  ! geometrically instead, each about {rms_on / (mid * 1.4):.1f}x clear of "
+              f"its state.")
+        if coupled:
+            # Do NOT suggest more gain here. The floor is mains coupled in ahead
+            # of the module's amplifier, so the pot multiplies it by the same
+            # factor as the signal and the ratio does not move -- it only walks
+            # the wave back into clipping. Measured here: 204/26 = 7.8x, fixed.
+            print("  ! DO NOT raise the gain to widen this: the floor is coupled mains,")
+            print("  ! amplified by the same pot as the signal, so the ratio will not")
+            print("  ! change -- you would only clip again. The separation is set by the")
+            print("  ! installation. To improve it, reduce the coupling: check for an RC")
+            print("  ! snubber or indicator lamp across the contactor, and route the")
+            print("  ! sense wires away from the pump's feed.")
+        else:
+            print("  ! The floor looks like ADC noise rather than coupled mains, so")
+            print("  ! raising the gain would widen the ratio -- but only if the")
+            print("  ! waveform stays unclipped. Re-run `plot` after any pot change.")
 
     print("\n--- Paste into src/pump/pump_sensor.cpp -------------------------------")
     print(f"#define DEFAULT_ON_COUNTS {on_counts:.1f}f")
     print(f"#define DEFAULT_OFF_COUNTS {off_counts:.1f}f")
     print("-----------------------------------------------------------------------")
-    print(f"\nMeasured {time.strftime('%Y-%m-%d')}: rms_off={rms_off:.2f} (worst of {n}), "
-          f"rms_on={rms_on:.2f} (worst of {n}),")
-    print(f"bias={statistics.median(off):.0f} ... put these numbers in the commit message.")
+    # `off` is the RMS list; the bias lives on the responses. An earlier version
+    # took the median of `off` here and labelled it "bias", printing a plausible
+    # two-digit number into the line meant to be pasted into the commit message.
+    bias_med = statistics.median([r["bias_counts"] for r in off_resps])
+    print(f"\nMeasured {time.strftime('%Y-%m-%d')}: rms_off={rms_off:.2f}, "
+          f"rms_on={rms_on:.2f} (both worst of {n}), separation {rms_on / rms_off:.1f}x,")
+    print(f"bias={bias_med:.0f}"
+          + (f", floor is coupled mains at ~{args.mains_hz:.0f} Hz" if coupled else "")
+          + " ... put these numbers in the commit message.")
 
+    # sys.executable, not a bare "python": PlatformIO's bundled interpreter is
+    # usually the only one with pyserial installed and is typically not on PATH
+    # at all, so a copy-pasted "python ..." fails with a Microsoft Store stub.
+    if os.name == "nt":
+        invocation = f'& "{sys.executable}" tools/pump_tune.py'
+    else:
+        invocation = f"{sys.executable} tools/pump_tune.py"
     print("\nVerify them WITHOUT reflashing first -- the board takes both per request:")
-    print(f'  python tools/pump_tune.py watch --on-counts {on_counts:.1f} '
+    print(f'  {invocation} watch --on-counts {on_counts:.1f} '
           f'--off-counts {off_counts:.1f}')
     print("Toggle the pump a few times; every reading should be a clean on/off,")
     print("never uncertain. Only then bake them in and re-flash.")
@@ -377,22 +606,58 @@ def sample_args(args):
     return out
 
 
+def add_common_opts(p, on_subparser):
+    """Options that work either BEFORE or AFTER the subcommand.
+
+    Declared on both the main parser and every subparser, on purpose. argparse
+    resolves a subparser's arguments after the main parser's, so an option
+    present in both would have its pre-subcommand value silently overwritten by
+    the subparser's default -- and declared on only one side, the other ordering
+    is a hard "unrecognized arguments" error. Since `calibrate` prints a ready-
+    made command with these flags in it, one of those orderings being rejected
+    means the tool hands the user a command it then refuses to run.
+
+    default=SUPPRESS on the subparser copies is what makes it work: those
+    arguments set nothing at all unless actually typed, so whichever side the
+    user put them on wins and the other keeps out of the way.
+    """
+    d = (lambda _: argparse.SUPPRESS) if on_subparser else (lambda v: v)
+    p.add_argument("--port", default=d(None),
+                   help="serial port; auto-detected when unambiguous")
+    p.add_argument("--cycles", type=int, default=d(10))
+    p.add_argument("--mains-hz", type=float, default=d(50.0))
+    p.add_argument("--rate-hz", type=int, default=d(2000))
+    p.add_argument("--on-counts", type=float, default=d(None),
+                   help="override the board's on threshold")
+    p.add_argument("--off-counts", type=float, default=d(None),
+                   help="override the board's off threshold")
+    p.add_argument("--counts-per-volt", type=float, default=d(None),
+                   help="supply to get vrms in the reply")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--port", help="serial port; auto-detected when unambiguous")
-    ap.add_argument("--cycles", type=int, default=10)
-    ap.add_argument("--mains-hz", type=float, default=50.0)
-    ap.add_argument("--rate-hz", type=int, default=2000)
-    ap.add_argument("--on-counts", type=float, help="override the board's on threshold")
-    ap.add_argument("--off-counts", type=float, help="override the board's off threshold")
-    ap.add_argument("--counts-per-volt", type=float, help="supply to get vrms in the reply")
+    add_common_opts(ap, on_subparser=False)
 
-    sub = ap.add_subparsers(dest="command", required=True)
+    _sub = ap.add_subparsers(dest="command", required=True)
+
+    class sub:  # noqa: N801 -- keeps the add_parser calls below unchanged
+        @staticmethod
+        def add_parser(name, **kw):
+            p = _sub.add_parser(name, **kw)
+            add_common_opts(p, on_subparser=True)
+            return p
+
     sub.add_parser("status").set_defaults(func=cmd_status)
     sub.add_parser("probe").set_defaults(func=cmd_probe)
 
     p = sub.add_parser("plot")
     p.add_argument("--dump-n", type=int, default=200)
+    p.add_argument(
+        "--ceiling", type=int, metavar="COUNTS",
+        help="highest count the module can actually reach, when that is lower "
+             "than the ADC rail -- e.g. ~2450 for an LM358 module run at 3V3. "
+             "Gain advice is measured against this instead of 4095.")
     p.set_defaults(func=cmd_plot)
 
     p = sub.add_parser("watch")
