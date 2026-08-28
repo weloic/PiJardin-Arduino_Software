@@ -17,7 +17,7 @@ They share the serial framing, but **not the chip** — see the warning below th
 | Board | Env | MCU | Source | Docs | What it does |
 | --- | --- | --- | --- | --- | --- |
 | Well level | `puit` | XIAO **SAMD21** | [src/puit/puit_sensor.cpp](src/puit/puit_sensor.cpp) | this file, below | Distance down to the water surface, HC-SR04 ultrasonic |
-| Pump state | `pump` | XIAO **RP2040** | [src/pump/pump_sensor.cpp](src/pump/pump_sensor.cpp) | [docs/pump.md](docs/pump.md) | Whether the pump is running, ZMPT101B AC voltage sense |
+| Pump state | `pump` | XIAO **RP2040** | [src/pump/pump_sensor.cpp](src/pump/pump_sensor.cpp) | [docs/pump.md](docs/pump.md) | **When** the pump starts and stops, ZMPT101B AC voltage sense |
 
 > ⚠️ **The two boards are different microcontrollers in an identical package.** A XIAO SAMD21 and a
 > XIAO RP2040 are the same size, the same pin count and the same colour; only the silkscreen tells
@@ -26,16 +26,34 @@ They share the serial framing, but **not the chip** — see the warning below th
 
 Both speak the **same NDJSON envelope** (`id` / `type` / `proto` / `status` / `code`) over USB
 serial, documented once in [Serial protocol contract](#serial-protocol-contract) below. They do
-**not** share a command set, and `proto` is numbered **per firmware** — the pump board is at
-`proto 1` while the well sensor is at `proto 2`. There is nothing for a new board's contract to be
-version 2 *of*, so each starts at 1 and is versioned independently. Always read `role` from the
-boot banner — **both** firmwares send it — rather than inferring the board from a `proto` number.
-`role` is not a literal in either sketch: it comes from `-DPIJARDIN_ROLE` in that environment's
-`build_flags`, so it cannot drift from the environment that built the firmware.
+**not** share a command set, and `proto` is numbered **per firmware** — each board's contract starts
+at 1 and is versioned independently, so the two are both at `proto 2` by coincidence and mean
+entirely different things by it. Always read `role` from the boot banner — **both** firmwares send
+it — rather than inferring the board from a `proto` number. `role` is not a literal in either
+sketch: it comes from `-DPIJARDIN_ROLE` in that environment's `build_flags`, so it cannot drift from
+the environment that built the firmware.
 
 > **Everything from [Serial protocol contract](#serial-protocol-contract) to the end of this file
 > describes the well sensor.** The pump board's contract, wiring and — importantly — its required
 > **calibration** live in [docs/pump.md](docs/pump.md).
+
+### Where the pump board departs from the shared contract
+
+The envelope is shared; the *interaction model* is not. Two differences a Pi-side reader must
+handle, both introduced by pump `proto 2`:
+
+- **The pump board talks without being asked.** It measures continuously and emits an unsolicited
+  `{"type":"event", …}` line the moment it decides the pump changed state, plus a heartbeat every
+  60 s. Such a line can arrive **at any moment, including between a request and its response** — so
+  match responses on `type == "resp"` *and* the echoed `id`, never on "next line in". A Pi that only
+  polls the pump board is not just slower, it silently misses every transition; that is exactly what
+  the `proto 1 → 2` bump exists to make assertable.
+- **The pump board is not stateless.** It latches, debounces and keeps the last 32 transitions in
+  RAM, because it is the only side watching continuously. Nothing is persisted to flash and no
+  threshold is settable over the wire — the rationale, and why the earlier stateless design was
+  right for what it was, is in [docs/pump.md](docs/pump.md#the-principle-that-reversed).
+
+The well sensor (`puit`) remains pure request/response and fully stateless.
 
 ### Adding a third board
 
@@ -636,7 +654,7 @@ pio run -e puit          # or -e pump
 | `firmware.elf` | same code with symbols, for debugging |
 
 Both firmwares produce a file called `firmware.bin`, distinguished only by which directory it came
-out of. **Rename them when you copy them out** (`puit-2.2.0.bin`, `pump-1.0.0.bin`) — past that
+out of. **Rename them when you copy them out** (`puit-2.2.0.bin`, `pump-2.0.0.bin`) — past that
 point nothing in the file says which board it belongs to, and flashing the wrong one gives a board
 that boots, answers, and is silently wrong.
 

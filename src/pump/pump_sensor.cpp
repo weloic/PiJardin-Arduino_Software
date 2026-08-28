@@ -5,17 +5,20 @@
 // before flashing -- `pio run -e pump` and `-e puit` build for different chips
 // and neither image will run on the other board.
 //
-// Answers one question: is the pump running right now? It does that by looking
-// for mains AC on the pump's own feed, which is a far more honest signal than a
-// current clamp threshold or a flow switch -- either the contactor is closed and
-// there is 230 V on the motor, or there is not.
+// Answers one question: WHEN did the pump start and stop? It does that by
+// looking for mains AC on the pump's own feed, which is a far more honest signal
+// than a current clamp threshold or a flow switch -- either the contactor is
+// closed and there is 230 V on the motor, or there is not.
 //
 // Talks to the Raspberry Pi over USB serial with the same newline-delimited JSON
-// (NDJSON) request/response protocol as the well sensor: one JSON object per
-// line, in both directions, every reply echoing the request "id". See README.md.
+// (NDJSON) envelope as the well sensor: one JSON object per line, in both
+// directions, every reply echoing the request "id". See README.md. Unlike the
+// well sensor, this board also speaks WITHOUT being asked:
 //
 //   Pi  -> {"id":7,"cmd":"read_pump"}\n
-//   MCU -> {"id":7,"type":"resp","proto":1,"status":"ok","state":"on",...}\n
+//   MCU -> {"id":7,"type":"resp","proto":2,"status":"ok","state":"on",...}\n
+//   MCU -> {"type":"event","proto":2,"role":"pump","ev":"pump","seq":412,...}\n
+//   MCU -> {"type":"event","proto":2,"role":"pump","ev":"hb","seq":413,...}\n
 //
 // WIRING, AND THE ONE WAY TO GET THIS WRONG
 // -----------------------------------------
@@ -26,18 +29,49 @@
 // for the board to detect that mistake: a correct reading and a useless one look
 // identical from here.
 //
-// The module is powered from the XIAO's 3V3 pad, NOT 5V. See VPIN below.
+// The module is powered from the XIAO's 3V3 pad, NOT 5V, and its OUT goes
+// straight to A0 with no divider. See VPIN below -- that arrangement is out of
+// spec on purpose and has a cost worth understanding.
 //
-// STATELESSNESS
-// -------------
-// Like the well sensor, the board keeps no state between requests. Every reading
-// is a fresh measurement window; whatever a request does not specify falls back
-// to the documented default, and every response echoes the values actually used.
-// In particular there is no on/off latching and no hysteresis here -- the board
-// reports what it measured plus an explicit "uncertain" verdict when the reading
-// falls between the thresholds, and the Pi (which has history) decides. A pump
-// that switches faster than the Pi polls will be missed; that is a property of
-// polling, not something the board can paper over.
+// STATE: A PRINCIPLE THAT WAS RECONSIDERED, NOT FORGOTTEN
+// -------------------------------------------------------
+// Up to fw 1.x this file argued the opposite of what it now does, and the
+// argument is preserved here because the next reader needs to know it was
+// reconsidered rather than overlooked. It said: the board keeps no state between
+// requests, there is no on/off latching and no hysteresis, the board reports
+// what it measured plus an explicit "uncertain" verdict and the Pi (which has
+// history) decides -- and, plainly, "a pump that switches faster than the Pi
+// polls will be missed; that is a property of polling, not something the board
+// can paper over."
+//
+// Every sentence of that was true FOR A POLLED BOARD. What changed is the
+// question, not the reasoning: the job is now to RECORD when the pump starts and
+// stops, and polling cannot do that. The Pi would have to ask every few seconds
+// forever, would still miss any cycle shorter than its interval, and -- the part
+// that actually breaks it -- would have no way to know what it missed while it
+// was rebooting or being redeployed. The board is the only thing watching
+// continuously, so the board must be the thing that decides, remembers and
+// reports.
+//
+// So latching, hysteresis and debounce move HERE (see stepDetector). The band
+// between off_counts and on_counts stops being a reported verdict and becomes
+// the thing hysteresis is made of: a reading inside it HOLDS the current state
+// rather than announcing indecision. `read_pump` still returns "uncertain",
+// because it is still an instantaneous, unlatched measurement and lying about
+// that would break tools/pump_tune.py's calibration.
+//
+// Statelessness survives everywhere it still applies, and is deliberately NOT
+// weakened:
+//   - thresholds and parameters are compile-time constants. They are settable
+//     per request for a measurement, never for the detector: nothing the Pi
+//     sends can change how this board decides.
+//   - nothing is persisted to flash. A reboot starts from "unknown", never from
+//     a remembered guess about a pump nobody was watching. uptime_ms in `status`
+//     is what tells the Pi a reboot happened, so since_ms is never extrapolated
+//     across one.
+//   - every response still echoes the effective values it used.
+// The only history the board keeps is what it has WATCHED since boot: a state,
+// how long it has held, and a 32-entry ring of the transitions it saw.
 //
 // This file duplicates the NDJSON transport from src/puit/puit_sensor.cpp on
 // purpose, and is deliberately structured the same way so the shared part can be
@@ -48,21 +82,39 @@
 
 // ZMPT101B analog out. On the XIAO RP2040 A0 is GPIO26 = ADC0.
 //
-// POWER THE MODULE FROM 5V, AND DIVIDE ITS OUTPUT 2:1 BEFORE THIS PIN.
+// THE MODULE RUNS FROM THE XIAO'S 3V3 PAD AND ITS `OUT` GOES DIRECTLY TO THIS
+// PIN. No divider, no 5 V anywhere. That is what is installed, every threshold
+// below was measured through it, and it is out of specification on purpose.
 //
-// Both halves are required, for opposite reasons. The stock ZMPT101B is
-// specified for 5-30 V and amplifies through an LM358, which cannot drive its
-// output within ~1.3 V of its positive rail -- run from 3V3 it flattens the top
-// of the wave at ~2.0 V while the bottom swings freely, and n_clipped never sees
-// it because that is nowhere near the ADC rails. Measured at 3V3 on real
-// hardware: bias 2032, max 2476 (+444), min 1480 (-552), rms 394 where a clean
-// sine of that peak gives 352. But on 5 V the module idles at 2.5 V and peaks
-// near 5 V, and the RP2040's GPIOs are not 5 V tolerant -- so two 10k resistors
-// halve it, keeping this pin under ~2.5 V with the LM358 on its proper rail.
+// What that costs, honestly:
 //
-// The divider puts the idle level near 1.25 V (~1550 counts) instead of
-// mid-scale. Nothing here needs adjusting for that: the bias is measured, not
-// assumed (see analyse()), and 1550 sits inside the default plausibility window.
+//   - The ZMPT101B is specified for +5 V to +30 V, so 3V3 is out of spec. It
+//     works here only because the gain pot is set low enough that the signal
+//     never reaches the region where the module breaks down. That is a working
+//     point, not a guarantee -- which is why the check below exists.
+//
+//   - The module amplifies through an LM358, which cannot drive its output
+//     closer than ~1.3 V to its positive rail. On 3V3 that puts its ceiling near
+//     2.0 V, about 2480 counts -- measured on this exact hardware at high gain,
+//     where the positive peaks topped out at 2476 and stopped moving. With the
+//     bias at 2052 that leaves roughly 430 counts of usable headroom ABOVE the
+//     bias against roughly 2050 below it. The swing is asymmetric and the
+//     positive peak is the binding constraint; the ADC's 4095 rail is not the
+//     limit and never comes into it.
+//
+//   - At the calibrated pot setting the running signal is rms 199.2 counts, so
+//     the peak is ~283 counts (rms/peak 0.703 -- essentially a clean sine).
+//     That is about 66% of the available headroom. It is a real margin rather
+//     than a comfortable one, and it is exactly why the headroom check below is
+//     needed instead of trusting n_clipped.
+//
+// DO NOT "fix" this by moving to 5 V or adding a 2:1 divider. Both would put the
+// LM358 on its proper rail and make the waveform symmetric, and both would also
+// invalidate every count in this file: DEFAULT_ON_COUNTS, DEFAULT_OFF_COUNTS and
+// FREQ_MIN_RMS were all measured through the front end described above. Changing
+// the front end means re-running the calibration, not editing this comment.
+// (5 V straight to A0 would additionally destroy the pin -- the RP2040 is not
+// 5 V tolerant.)
 #define VPIN A0
 
 // GPIO17, the red user LED. THE XIAO RP2040'S USER LEDS ARE ACTIVE LOW -- the
@@ -75,17 +127,24 @@
 
 // --- Protocol / firmware identity -------------------------------------------
 // proto is numbered per firmware, not per repo: this board shares the well
-// sensor's envelope (id/type/proto/status/code) but not its command set, so
-// there is nothing for it to be "version 2" of. The pump contract starts at 1.
-#define FW_VERSION "1.0.0"
-#define PROTO_VERSION 1
+// sensor's envelope (id/type/proto/status/code) but not its command set, so the
+// pump contract started at 1 and is versioned independently.
+//
+// 1 -> 2 is the move from polled-only to event-pushing. Every proto-1 command
+// still works unchanged, so the break is not in the request path -- it is that a
+// Pi which only polls now silently misses every transition the board records.
+// That is precisely the kind of change a version number has to make assertable,
+// so the Pi can refuse to run against a board it would misread. Nothing on the
+// Pi consumes pump proto 1 yet, so there is no flag day to manage.
+#define FW_VERSION "2.0.0"
+#define PROTO_VERSION 2
 
 // Board role, injected per environment by platformio.ini (-DPIJARDIN_ROLE). It rides on
-// the boot banner and the status response so the Pi can tell the two boards apart from
-// the data itself, rather than guessing from a USB VID or a proto number. Deliberately
-// not a literal here: a copy in the source could disagree with the environment that
-// built it, and a firmware that lies about its role is worse than one that will not
-// compile.
+// the boot banner, every event line and the status response so the Pi can tell the two
+// boards apart from the data itself, rather than guessing from a USB VID or a proto
+// number. Deliberately not a literal here: a copy in the source could disagree with the
+// environment that built it, and a firmware that lies about its role is worse than one
+// that will not compile.
 #ifndef PIJARDIN_ROLE
 #error "PIJARDIN_ROLE is not defined -- set it in this environment's build_flags in platformio.ini"
 #endif
@@ -96,6 +155,12 @@
 // A sample this close to either rail is clipped: the true peak was cut off, so
 // the RMS below it is an underestimate. Counted, not fatal -- for on/off
 // purposes a clipped waveform still unambiguously means "on".
+//
+// On THIS front end this check never fires, and that is the point of the
+// headroom check below rather than a reason to delete it: the LM358 flattens the
+// wave at ~2480 counts, nowhere near 0 or 4095, so n_clipped stays 0 through the
+// entire failure. It still earns its place because a different module, or this
+// one on a proper 5 V rail, can genuinely reach the rails.
 #define CLIP_MARGIN 4
 // The first conversions after power-up or a mux change are unreliable, on the
 // RP2040's SAR ADC as on the SAMD21's. Throw a few away before the timed window
@@ -103,7 +168,8 @@
 #define DISCARD_READS 8
 // Below this RMS (counts) no frequency is derived at all -- see analyse(). A
 // real signal at any usable gain sits in the hundreds, so this only ever gates
-// out traces that are pure noise.
+// out traces that are pure noise. It also gates the headroom check below, for
+// the same reason: both are ratios that mean nothing on a noise floor.
 //
 // Raised from the original 10.0 on 2026-08-28, and this one is measured too. The
 // RP2040's SAR ADC has a documented differential-nonlinearity problem -- codes it
@@ -118,6 +184,39 @@
 // Re-measure it if the installation changes; tools/pump_tune.py prints the
 // figure and now recommends the value directly.
 #define FREQ_MIN_RMS 40.0f
+
+// --- Headroom / soft clipping ------------------------------------------------
+// The failure mode the 3V3 supply creates, and the one n_clipped structurally
+// cannot see. The LM358 runs out of headroom and flattens the top of the wave at
+// ~2480 counts while the bottom half swings freely; both ADC rails stay
+// untouched, so every number in the reply looks healthy while the RMS quietly
+// understates the signal.
+//
+// Detected by ASYMMETRY about the measured bias rather than against a hardcoded
+// ceiling:
+//
+//   asym = (max_counts - bias) / (bias - min_counts)
+//
+// A clean sine gives ~1.0. The measured over-gain case gives
+// (2476-2032)/(2032-1480) = 0.80. The ratio is self-calibrating -- it stays
+// valid if the supply sags, the pot moves, or the module is replaced, none of
+// which a fixed 2480 would survive.
+//
+// Evaluated ONLY above FREQ_MIN_RMS. On a pump-off noise floor min and max are
+// a handful of DNL-inflated counts either side of the bias and the ratio is
+// meaningless.
+//
+// It is a WARNING and never a fault. A soft-clipped waveform still unambiguously
+// means the pump is on, and refusing to report a running pump because its
+// waveform is ugly would be a worse failure than the one being reported. What it
+// means is that the pot wants turning down -- and it is early warning that a
+// mains overvoltage will start clipping: 230 V +10% = 253 V pushes the peak from
+// ~283 to ~311 counts, against ~430 of headroom.
+//
+// Soft clipping does NOT affect freq_hz. The Schmitt band sits at 0.25 x rms
+// around the bias, far below the flattened peak, so the crossings it counts are
+// nowhere near the compressed region.
+#define ASYM_MIN 0.90f
 
 // --- Sampling window ---------------------------------------------------------
 // Samples are stored rather than accumulated on the fly, so the buffer is what
@@ -156,9 +255,13 @@
 //
 // Placed geometrically between the two states rather than by the 5x / div-3
 // rule, which needs about 20x separation before it leaves a usable gap -- at
-// 15.4x it put the two thresholds 1.7 counts apart. The band between them is the
-// "uncertain" verdict and it does real work: a 200 ms window that straddles the
-// contactor lands in it, which is exactly the case the board must not guess at.
+// 15.4x it put the two thresholds 1.7 counts apart. The band between them does
+// real work: a 200 ms window that straddles the contactor lands in it, which is
+// exactly the case the board must not act on. The detector HOLDS its state
+// through that band; `read_pump` reports it as "uncertain".
+//
+// The detector uses these same constants. It does not take them from a request:
+// a per-request override changes one measurement, never how the board decides.
 //
 // Re-run the calibration if the pot moves, the module is replaced, or anything
 // changes on that circuit -- see docs/pump.md.
@@ -174,8 +277,81 @@
 // reported as "pump off": both produce a low RMS and they are otherwise
 // indistinguishable. Same reasoning as the well sensor separating a dead
 // HC-SR04 from one that simply found no echo.
+//
+// With the divider gone the module really does idle at mid-scale, so the
+// measured 2052 sits centrally in this window and the check is doing exactly
+// what its name says.
 #define DEFAULT_BIAS_MIN 1024        // 25% of full scale
 #define DEFAULT_BIAS_MAX 3072        // 75% of full scale
+
+// --- Detector ----------------------------------------------------------------
+// A window is measured continuously in loop(), not only on request, and the
+// state machine below runs on every one.
+//
+// DETECT_CYCLES is DEFAULT_CYCLES on purpose and should not be shortened to
+// improve latency. The calibrated floor (12.93 counts) and signal (199.20
+// counts) were both measured at a 10-cycle window; a narrower one integrates
+// less noise away and moves the floor, which is the figure the thresholds were
+// placed against. Latency is bought with DEBOUNCE_WINDOWS, not by making the
+// measurement worse.
+#define DETECT_CYCLES DEFAULT_CYCLES
+
+// A candidate state must survive this many consecutive windows before it is
+// declared. 3 x 200 ms = 600 ms, and it absorbs the three things that otherwise
+// manufacture a phantom transition: contactor bounce, motor inrush, and the
+// window that straddles the switching instant (which lands in the uncertain band
+// or at a nonsense frequency).
+//
+// This is what sets the resolution floor of the WHOLE system: a pump cycle
+// shorter than roughly 600-800 ms is not resolved, here or on the Pi. Say so
+// plainly rather than implying millisecond timestamps mean millisecond accuracy.
+#define DEBOUNCE_WINDOWS 3
+
+// To declare ON it is not enough for the RMS to clear on_counts: the frequency
+// must also be mains. A high RMS at the wrong frequency is induced hum, pickup
+// or a wiring fault, not a running pump. A rejected window HOLDS the current
+// state and is counted in n_freq_reject -- deliberately not a fifth state, which
+// would push a diagnostic into the contract the Pi has to switch on, and would
+// still not tell it anything the counter does not.
+#define FREQ_MATCH_HZ 5.0f
+
+// Emitted regardless of state. Without it the Pi cannot distinguish "pump off
+// for six hours" from "board dead for six hours", and that distinction is the
+// entire point of recording this.
+#define HEARTBEAT_MS 60000UL
+
+// Transitions kept in RAM so a Pi that was down can ask for what it missed. 32
+// entries is ~256 bytes and covers a couple of days of ordinary irrigation; a Pi
+// outage longer than 32 transitions loses the oldest, which `history` reports as
+// truncated rather than hiding. Published in `status` as history_max so the Pi
+// sizes its expectations from the board.
+#define HISTORY_MAX 32
+// One reply carries at most this many events, so it stays bounded: ~480 bytes
+// worst case against LINE_MAX's 192-byte cap on the *request*, which bounds
+// nothing on the way back. The Pi calls again with a higher after_seq when
+// `more` is true.
+//
+// That is larger than the 256-byte CDC TX buffer, and deliberately so: this is a
+// SOLICITED reply, sent to a host that just asked for it and is therefore
+// reading, so it may take two buffer fills the way a `sampling` dump already
+// takes ten. The never-block rule (see emitUnsolicited) applies to lines nobody
+// asked for -- those are the ones that can pile up against a host that has
+// stopped listening.
+#define HISTORY_REPLY_MAX 8
+
+// The board now runs unattended and continuously, and nothing can restart it
+// remotely: the Pi cannot reset it, and recovery from a hang would mean a UF2
+// reflash or a walk to the well. A hung detector is silent data loss, which is
+// the failure this whole firmware exists to prevent.
+//
+// 8 s is comfortably longer than the slowest legitimate blocking stretch -- a
+// 60-cycle window at 40 Hz mains is 1.5 s, and a `sampling` reply with 400 raw
+// counts is a couple of kB to a host that is actively reading. It is deliberately
+// NOT fed from inside a stalled Serial.write: a solicited reply that cannot
+// drain in 8 s means the host stopped reading mid-reply, and resetting is the
+// correct response to that -- the alternative is a board parked in write()
+// forever, no longer watching the pump.
+#define WATCHDOG_MS 8000
 
 // --- Waveform dump -----------------------------------------------------------
 // `sampling` can return raw counts so the pot can be set by eye. The head of the
@@ -216,8 +392,25 @@ struct Reading {
   float rms;                   // RMS of the bias-removed signal, in counts
   uint16_t min_counts, max_counts;
   int n_clipped;
+  float asym;                  // (max-bias)/(bias-min); ~1.0 for a clean sine
+  bool headroom_warn;          // asym below ASYM_MIN, with enough signal to mean it
   int n_rise;                  // rising crossings of the bias level
   float freq_hz;               // n_rise / window, 0 when nothing crossed
+};
+
+// The four states the detector can be in. `unknown` is the boot state and is
+// never a guess: the board cannot know what the pump was doing before it was
+// watching. `fault` is its own state rather than a flavour of off, for the same
+// reason sensor_fault is its own error code.
+enum DetState { ST_UNKNOWN = 0, ST_OFF, ST_ON, ST_FAULT };
+static const char *const STATE_NAME[] = {"unknown", "off", "on", "fault"};
+
+// One recorded transition. Only `pump` events land here -- heartbeats consume a
+// seq but carry no information a replay could need.
+struct HistEntry {
+  uint32_t seq;
+  uint32_t ms;
+  uint8_t state;
 };
 
 // --- Sample buffer -----------------------------------------------------------
@@ -231,15 +424,38 @@ static char lineBuf[LINE_MAX];
 static size_t lineLen = 0;
 static bool lineOverflow = false;
 
+// --- Detector state ----------------------------------------------------------
+// All of it RAM only. Nothing here is written to flash, so a reboot starts from
+// ST_UNKNOWN with an empty ring -- see the header.
+static SampleParams detParams;          // the compile-time defaults, fixed at boot
+
+static DetState detState = ST_UNKNOWN;
+static uint32_t detSinceMs = 0;         // millis() when detState was declared
+static DetState detPending = ST_UNKNOWN;
+static uint8_t detPendingN = 0;         // consecutive windows agreeing on detPending
+
+static uint32_t evSeq = 0;              // monotonic per boot, every event line
+static uint32_t nDropped = 0;           // event lines the TX path had no room for
+static uint32_t nFreqReject = 0;        // windows loud enough for ON at a wrong freq
+static uint32_t nHeadroom = 0;          // windows flagged by the asym check
+static uint32_t lastHbMs = 0;
+
+static HistEntry hist[HISTORY_MAX];
+static uint8_t histCount = 0;           // entries currently held
+static uint8_t histHead = 0;            // next write slot (and the oldest, once full)
+static uint32_t histEvictedSeq = 0;     // seq of the newest entry ever overwritten
+
 // --- Prototypes --------------------------------------------------------------
 bool hasContent();
 void handleLine(const char *line);
 void handleReadPump(JsonVariantConst id, JsonVariantConst req);
 void handleSampling(JsonVariantConst id, JsonVariantConst req);
 void handleStatus(JsonVariantConst id);
+void handleHistory(JsonVariantConst id, JsonVariantConst req);
 bool optInt(JsonVariantConst req, const char *key, int *out, const char **bad_field);
 bool optULong(JsonVariantConst req, const char *key, unsigned long *out, const char **bad_field);
 bool optFloat(JsonVariantConst req, const char *key, float *out, const char **bad_field);
+void setDefaults(SampleParams *p);
 bool parseParams(JsonVariantConst req, SampleParams *p, const char **bad_field);
 void beginResponse(JsonDocument &doc, JsonVariantConst id);
 void addContext(JsonDocument &doc, const Reading *r, const SampleParams *p);
@@ -250,6 +466,15 @@ void sendError(const JsonVariantConst *id, const char *code, const char *field);
 void sendResponse(const JsonDocument &doc);
 void sampleWindow(Reading *r, const SampleParams *p);
 void analyse(Reading *r);
+void serviceSerial();
+void stepDetector();
+void resetDebounce();
+void declareState(DetState s, const Reading *r);
+void emitHeartbeat(const Reading *r);
+void beginEvent(JsonDocument &doc, const char *ev);
+void addFixed2(JsonDocument &doc, const char *key, float v, char *buf);
+bool emitUnsolicited(const JsonDocument &doc, bool count_drop);
+void historyPush(uint32_t seq, DetState s, uint32_t ms);
 
 void setup() {
   // 12-bit conversions: the signal of interest at the "off" end is a handful of
@@ -263,17 +488,41 @@ void setup() {
   pinMode(LEDPIN, OUTPUT);
   digitalWrite(LEDPIN, LED_OFF);
 
-  // Boot banner: structured "ready" line the Pi waits for after reset.
+  setDefaults(&detParams);
+  detParams.cycles = DETECT_CYCLES;
+  lastHbMs = millis();
+
+  // Armed before the first line goes out, deliberately. The banner is the only
+  // thing between reset and the detector running, and a board wedged in
+  // Serial.write() printing a greeting is a board that never starts watching.
+  rp2040.wdt_begin(WATCHDOG_MS);
+
+  // Boot banner: structured "ready" line the Pi waits for after reset. Sent
+  // through the same non-blocking guard as every other unsolicited line, and for
+  // the same reason -- it is best-effort by nature anyway, because the XIAO's
+  // native USB does not reset on port open and the banner has usually already
+  // gone out before a host is listening. `status` is the real handshake.
   JsonDocument doc;
   doc["type"] = "ready";
   doc["proto"] = PROTO_VERSION;
   doc["fw"] = FW_VERSION;
   doc["role"] = PIJARDIN_ROLE;  // two boards speak this envelope; say which one this is
-  serializeJson(doc, Serial);
-  Serial.println();
+  emitUnsolicited(doc, false);  // not counted in `dropped`: that counts lost events
 }
 
+// One pass: drain whatever the host has sent, then measure one window and run
+// the state machine on it.
+//
+// Requests are parsed BETWEEN windows, never during one, so a reply can be up to
+// one window (~200 ms) late. That is the right trade: a late reply costs
+// nothing, and a missed window costs a transition.
 void loop() {
+  rp2040.wdt_reset();
+  serviceSerial();
+  stepDetector();
+}
+
+void serviceSerial() {
   while (Serial.available() > 0) {
     char c = (char)Serial.read();
 
@@ -336,10 +585,14 @@ void handleLine(const char *line) {
   const char *cmd = req["cmd"] | "";
   if (strcmp(cmd, "read_pump") == 0) {
     handleReadPump(id, req.as<JsonVariantConst>());
+    resetDebounce();
   } else if (strcmp(cmd, "sampling") == 0) {
     handleSampling(id, req.as<JsonVariantConst>());
+    resetDebounce();
   } else if (strcmp(cmd, "status") == 0) {
     handleStatus(id);
+  } else if (strcmp(cmd, "history") == 0) {
+    handleHistory(id, req.as<JsonVariantConst>());
   } else {
     sendError(&id, "unknown_cmd", nullptr);
   }
@@ -366,9 +619,15 @@ void handleReadPump(JsonVariantConst id, JsonVariantConst req) {
   JsonDocument doc;
   beginResponse(doc, id);
   doc["status"] = "ok";
-  // The answer is three-valued, so it cannot be a boolean: "uncertain" is a real
-  // outcome (RMS between the thresholds) and collapsing it into either true or
-  // false would invent a decision the board is not in a position to make.
+  // Still three-valued, and still unlatched. This is an INSTANTANEOUS
+  // measurement with whatever thresholds the request asked for -- it is what
+  // tools/pump_tune.py calibrates against, so it must not quietly start
+  // returning the detector's latched verdict instead. "uncertain" is a real
+  // outcome for one window and collapsing it into true or false would invent a
+  // decision this reading is not in a position to make. The detector's answer,
+  // which does have history behind it, is deliberately NOT mixed in here -- it
+  // lives on the event lines and in `status`, where it cannot be confused with
+  // this one.
   doc["state"] = classify(&r, &p);
   addMeasurement(doc, &r, &p);
   addContext(doc, &r, &p);
@@ -400,7 +659,8 @@ void handleSampling(JsonVariantConst id, JsonVariantConst req) {
 
   // Raw counts, oldest first, contiguous from the start of the window. Plot
   // these to set the module's gain pot: a clean sine well inside 0..ADC_MAX is
-  // the target, and flat tops mean the gain is too high.
+  // the target, and flat tops mean the gain is too high. On this front end the
+  // flat top appears at ~2480 counts, not at the rail -- see asym.
   int dump = (p.dump_n < r.n) ? p.dump_n : r.n;
   JsonArray samples = doc["samples"].to<JsonArray>();
   for (int i = 0; i < dump; i++) {
@@ -411,6 +671,13 @@ void handleSampling(JsonVariantConst id, JsonVariantConst req) {
   sendResponse(doc);
 }
 
+// Identity, limits, defaults -- and the detector's live state.
+//
+// This is the Pi's handshake AND its resync primitive. On every connect it reads
+// `state` and `since_ms` and back-dates a change that happened while it was
+// away; `uptime_ms` is what tells it the board rebooted, so since_ms is never
+// extrapolated across a reboot it did not see. `seq` tells it whether it has
+// missed event lines, and `history` gets them back.
 void handleStatus(JsonVariantConst id) {
   JsonDocument doc;
   beginResponse(doc, id);
@@ -418,6 +685,15 @@ void handleStatus(JsonVariantConst id) {
   doc["fw"] = FW_VERSION;
   doc["role"] = PIJARDIN_ROLE;
   doc["uptime_ms"] = millis();
+
+  // Detector state. Unsigned subtraction, so the millis() wrap is handled here
+  // and never by the Pi.
+  doc["state"] = STATE_NAME[detState];
+  doc["since_ms"] = (uint32_t)(millis() - detSinceMs);
+  doc["seq"] = evSeq;
+  doc["dropped"] = nDropped;
+  doc["n_freq_reject"] = nFreqReject;
+  doc["n_headroom"] = nHeadroom;
 
   // Limits and defaults, so the Pi can discover them instead of hardcoding a
   // second copy of these constants.
@@ -435,6 +711,59 @@ void handleStatus(JsonVariantConst id) {
   doc["bias_max_default"] = DEFAULT_BIAS_MAX;
   doc["max_dump_n"] = MAX_DUMP_N;
   doc["line_max"] = LINE_MAX;
+
+  // The detector's own constants. Not settable -- published so nothing
+  // downstream has to keep a second copy that can drift.
+  doc["detect_cycles"] = DETECT_CYCLES;
+  doc["debounce"] = DEBOUNCE_WINDOWS;
+  doc["hb_ms"] = HEARTBEAT_MS;
+  doc["history_max"] = HISTORY_MAX;
+  doc["freq_min_rms"] = FREQ_MIN_RMS;
+  doc["freq_match_hz"] = FREQ_MATCH_HZ;
+  doc["asym_min"] = ASYM_MIN;
+  sendResponse(doc);
+}
+
+// Replay the transitions the Pi missed while it was away.
+//
+// This is what makes a Pi reboot lossless. Without it a pump cycle that both
+// starts AND ends while the Pi is down disappears with no trace at all -- the
+// daily runtime is quietly short and nothing indicates it.
+void handleHistory(JsonVariantConst id, JsonVariantConst req) {
+  unsigned long after_seq = 0;  // absent means "everything still buffered"
+  const char *bad_field = nullptr;
+  if (!optULong(req, "after_seq", &after_seq, &bad_field)) {
+    sendError(&id, "bad_param", bad_field);
+    return;
+  }
+
+  JsonDocument doc;
+  beginResponse(doc, id);
+  doc["status"] = "ok";
+
+  JsonArray events = doc["events"].to<JsonArray>();
+  bool more = false;
+  int sent = 0;
+  for (uint8_t i = 0; i < histCount; i++) {
+    const HistEntry &e = hist[(uint8_t)((histHead + HISTORY_MAX - histCount + i) % HISTORY_MAX)];
+    if (e.seq <= (uint32_t)after_seq) continue;
+    if (sent >= HISTORY_REPLY_MAX) {
+      // Capped, not exhausted. The Pi calls again with the last seq it got.
+      more = true;
+      break;
+    }
+    JsonObject o = events.add<JsonObject>();
+    o["seq"] = e.seq;
+    o["state"] = STATE_NAME[e.state];
+    o["ms"] = e.ms;
+    sent++;
+  }
+
+  // True when entries newer than after_seq have already been overwritten, so
+  // some transitions are permanently gone. The Pi has to know that rather than
+  // assuming an empty or short reply means it got everything.
+  doc["truncated"] = (histEvictedSeq > (uint32_t)after_seq);
+  doc["more"] = more;
   sendResponse(doc);
 }
 
@@ -466,10 +795,9 @@ bool optFloat(JsonVariantConst req, const char *key, float *out, const char **ba
   return true;
 }
 
-// Fill p from the request. A wrong *type* is an error; an out-of-range value is
-// clamped, because every response echoes the effective parameters and so makes
-// the clamp visible to the Pi.
-bool parseParams(JsonVariantConst req, SampleParams *p, const char **bad_field) {
+// The documented defaults, in one place, because the detector needs exactly the
+// same set with nothing from the wire in it.
+void setDefaults(SampleParams *p) {
   p->cycles = DEFAULT_CYCLES;
   p->mains_hz = DEFAULT_MAINS_HZ;
   p->rate_hz = DEFAULT_RATE_HZ;
@@ -479,6 +807,13 @@ bool parseParams(JsonVariantConst req, SampleParams *p, const char **bad_field) 
   p->bias_max = DEFAULT_BIAS_MAX;
   p->counts_per_volt = 0.0f;  // absent means absent; see addMeasurement
   p->dump_n = DEFAULT_DUMP_N;
+}
+
+// Fill p from the request. A wrong *type* is an error; an out-of-range value is
+// clamped, because every response echoes the effective parameters and so makes
+// the clamp visible to the Pi.
+bool parseParams(JsonVariantConst req, SampleParams *p, const char **bad_field) {
+  setDefaults(p);
 
   if (!optInt(req, "cycles", &p->cycles, bad_field)) return false;
   if (!optFloat(req, "mains_hz", &p->mains_hz, bad_field)) return false;
@@ -538,10 +873,16 @@ void addMeasurement(JsonDocument &doc, const Reading *r, const SampleParams *p) 
   doc["bias_counts"] = r->bias;
   doc["min_counts"] = r->min_counts;
   doc["max_counts"] = r->max_counts;
-  // Non-zero means the peaks were cut off, so rms_counts (and any voltage below
-  // it) understates the real signal. Harmless for an on/off verdict, but it is
-  // the sign that the module's gain pot wants turning down.
+  // Non-zero means the peaks were cut off at an ADC RAIL, so rms_counts (and any
+  // voltage below it) understates the real signal. On this front end it stays 0
+  // even while the wave is being flattened -- see asym.
   doc["n_clipped"] = r->n_clipped;
+  // Swing above the bias over swing below it. ~1.0 is a clean sine; below
+  // ASYM_MIN the LM358 is running out of headroom and flattening the positive
+  // peaks hundreds of counts below the rail, where n_clipped cannot see it. A
+  // warning, never a fault: the pump is still unambiguously on. Meaningless
+  // below FREQ_MIN_RMS, where min and max are just noise.
+  doc["asym"] = r->asym;
   // Frequency from rising crossings of the measured bias. Its job is to catch
   // the case a bare RMS threshold cannot: a floating or badly routed input picks
   // up enough hum to clear on_counts without the pump running. Mains reads
@@ -605,8 +946,13 @@ bool gateReading(JsonVariantConst id, const Reading *r, const SampleParams *p) {
   return false;
 }
 
-// RMS against the two thresholds. The band between them is reported rather than
-// resolved, because resolving it needs history and the board has none.
+// RMS against the two thresholds, for ONE window with no memory.
+//
+// The band between them is reported as "uncertain" here and resolved by the
+// detector, which holds its current state through it -- that band is what the
+// hysteresis is made of. Both callers matter: this is the unlatched view that
+// tools/pump_tune.py calibrates against, and it is also the raw input the state
+// machine consumes.
 const char *classify(const Reading *r, const SampleParams *p) {
   if (r->rms >= p->on_counts) return "on";
   if (r->rms <= p->off_counts) return "off";
@@ -633,9 +979,198 @@ void sendError(const JsonVariantConst *id, const char *code, const char *field) 
   sendResponse(doc);
 }
 
+// Solicited replies only, and this one MAY block: somebody asked, so somebody is
+// reading, and a `sampling` dump is several kB no TX buffer would ever hold at
+// once. The watchdog is the backstop if that assumption turns out to be false.
+// Unsolicited lines take emitUnsolicited() instead and never block at all.
 void sendResponse(const JsonDocument &doc) {
   serializeJson(doc, Serial);
   Serial.println();
+}
+
+// --- Unsolicited output ------------------------------------------------------
+
+// Seed an event line. Note the seq is consumed here, before the line is known to
+// be sendable: seq counts events the board GENERATED, and a gap is exactly how
+// the Pi learns one was lost. Bumping it only on success would hide the loss.
+void beginEvent(JsonDocument &doc, const char *ev) {
+  doc["type"] = "event";
+  doc["proto"] = PROTO_VERSION;
+  doc["role"] = PIJARDIN_ROLE;
+  doc["ev"] = ev;
+  doc["seq"] = ++evSeq;
+}
+
+// Put a float on an event line as a JSON number with exactly two decimals,
+// rather than letting ArduinoJson pick a length.
+//
+// This is a size constraint, not a cosmetic one. The CDC TX buffer is 256 bytes
+// and emitUnsolicited() below refuses to write a line that will not fit in it,
+// so a line's WORST-CASE length has to be known: an event that could grow past
+// the buffer would not be dropped occasionally, it would be dropped every time,
+// forever, with only the `dropped` counter to show for it. ArduinoJson's own
+// float formatting can run to nine significant digits, which is enough to push a
+// heartbeat over. Bounding the text bounds the line -- worst case 251 bytes for
+// a heartbeat, 203 for a transition, both with every counter at 2^32.
+//
+// Two decimals is also all any of these figures means: rms is counts, freq is
+// hertz to a hundredth, asym is a ratio near 1.
+//
+// `buf` must be at least 16 bytes and stay alive until the document is
+// serialized -- the callers keep it on their own stack frame for that reason.
+void addFixed2(JsonDocument &doc, const char *key, float v, char *buf) {
+  dtostrf(v, 0, 2, buf);
+  doc[key] = serialized(buf);
+}
+
+// Write an unsolicited line, or drop it. NEVER blocks.
+//
+// If the host is enumerated but not reading, the CDC TX buffer fills and
+// Serial.write() stalls -- and a board stalled in Serial.write() has stopped
+// watching the pump. So the line is only written when it is already known to
+// fit, and otherwise thrown away and counted. Dropping costs nothing but
+// timeliness: the transition is in the ring buffer either way, and `history`
+// hands it back. Detection must never be hostage to the link.
+bool emitUnsolicited(const JsonDocument &doc, bool count_drop) {
+  size_t need = measureJson(doc) + 1;  // + the newline
+  if (!Serial || (size_t)Serial.availableForWrite() < need) {
+    if (count_drop) nDropped++;
+    return false;
+  }
+  serializeJson(doc, Serial);
+  Serial.write('\n');
+  return true;
+}
+
+// --- Detector ----------------------------------------------------------------
+
+// Forget any part-accumulated candidate and start counting again from the
+// current state.
+//
+// Called after read_pump and sampling. Those take the ADC for up to ~1.2 s, and
+// the detector is blind for all of it: the windows either side of the gap can
+// straddle a switching instant, or simply be separated by long enough that three
+// "consecutive" windows no longer mean 600 ms of continuous evidence. A blind
+// spot must not be able to manufacture a phantom transition, so the debounce
+// starts over rather than resuming mid-count.
+void resetDebounce() {
+  detPending = detState;
+  detPendingN = 0;
+}
+
+// One measurement window, then the state machine.
+void stepDetector() {
+  Reading r;
+  sampleWindow(&r, &detParams);
+
+  if (r.headroom_warn) nHeadroom++;
+
+  // Candidate state for this window. Anything inconclusive falls through as
+  // "hold what we have", which is the hysteresis.
+  DetState cand = detState;
+  bool bias_ok = (r.bias >= (float)detParams.bias_min && r.bias <= (float)detParams.bias_max);
+  if (!bias_ok) {
+    // A real transition with a real event, never reported as `off`. Both a dead
+    // module and a stopped pump read a low RMS; the bias is what separates them.
+    cand = ST_FAULT;
+  } else {
+    const char *verdict = classify(&r, &detParams);
+    if (strcmp(verdict, "on") == 0) {
+      // Loud enough, but is it mains? A high RMS at the wrong frequency is hum
+      // or a wiring fault. Hold and count it, so it is visible rather than
+      // silent.
+      if (r.freq_hz > 0.0f && fabsf(r.freq_hz - detParams.mains_hz) <= FREQ_MATCH_HZ) {
+        cand = ST_ON;
+      } else {
+        nFreqReject++;
+      }
+    } else if (strcmp(verdict, "off") == 0) {
+      cand = ST_OFF;
+    }
+    // "uncertain" holds. That band is the hysteresis, not a verdict.
+  }
+
+  if (cand == detPending) {
+    if (detPendingN < 255) detPendingN++;
+  } else {
+    detPending = cand;
+    detPendingN = 1;
+  }
+
+  if (detPendingN >= DEBOUNCE_WINDOWS && detPending != detState) {
+    declareState(detPending, &r);
+  }
+
+  uint32_t now = millis();
+  if ((uint32_t)(now - lastHbMs) >= HEARTBEAT_MS) {
+    // Reset from `now`, not by adding HEARTBEAT_MS, so a long blocking command
+    // cannot leave a backlog of heartbeats to fire off back to back.
+    lastHbMs = now;
+    emitHeartbeat(&r);
+  }
+}
+
+// Commit a debounced state change: record it, then try to announce it.
+void declareState(DetState s, const Reading *r) {
+  DetState prev = detState;
+  uint32_t prev_ms = detSinceMs;
+
+  detState = s;
+  detSinceMs = millis();
+
+  char b_rms[16], b_freq[16], b_asym[16];
+  JsonDocument doc;
+  beginEvent(doc, "pump");
+  doc["state"] = STATE_NAME[s];
+  doc["ms"] = detSinceMs;
+  addFixed2(doc, "rms_counts", r->rms, b_rms);
+  addFixed2(doc, "freq_hz", r->freq_hz, b_freq);
+  addFixed2(doc, "asym", r->asym, b_asym);
+  doc["prev_state"] = STATE_NAME[prev];
+  doc["prev_ms"] = prev_ms;
+
+  // Ring first, wire second. The buffer is the record; the line is only the
+  // notification, and it is allowed to fail.
+  historyPush(evSeq, s, detSinceMs);
+  emitUnsolicited(doc, true);
+}
+
+// "I am alive, and this is what I still think." Every HEARTBEAT_MS regardless of
+// state, because silence has to mean something and it cannot mean two things.
+void emitHeartbeat(const Reading *r) {
+  uint32_t now = millis();
+
+  char b_rms[16], b_freq[16], b_asym[16];
+  JsonDocument doc;
+  beginEvent(doc, "hb");
+  doc["state"] = STATE_NAME[detState];
+  doc["ms"] = now;
+  addFixed2(doc, "rms_counts", r->rms, b_rms);
+  addFixed2(doc, "freq_hz", r->freq_hz, b_freq);
+  addFixed2(doc, "asym", r->asym, b_asym);
+  // Unsigned subtraction: the millis() wrap at ~49.7 days is handled here, once,
+  // and never by the Pi.
+  doc["since_ms"] = (uint32_t)(now - detSinceMs);
+  doc["dropped"] = nDropped;
+  doc["n_freq_reject"] = nFreqReject;
+  doc["n_headroom"] = nHeadroom;
+  emitUnsolicited(doc, true);
+}
+
+// Append one transition, overwriting the oldest when full.
+void historyPush(uint32_t seq, DetState s, uint32_t ms) {
+  if (histCount == HISTORY_MAX) {
+    // histHead points at the oldest entry once the ring is full, and it is about
+    // to be overwritten. Remembering its seq is what lets `history` answer
+    // "some of what you asked for is permanently gone" instead of returning a
+    // short list that reads like completeness.
+    histEvictedSeq = hist[histHead].seq;
+  }
+  hist[histHead].seq = seq;
+  hist[histHead].ms = ms;
+  hist[histHead].state = (uint8_t)s;
+  histHead = (uint8_t)((histHead + 1) % HISTORY_MAX);
+  if (histCount < HISTORY_MAX) histCount++;
 }
 
 // --- Sensing -----------------------------------------------------------------
@@ -687,13 +1222,15 @@ void sampleWindow(Reading *r, const SampleParams *p) {
   analyse(r);
 }
 
-// Reduce sampleBuf to bias, RMS, extremes and frequency.
+// Reduce sampleBuf to bias, RMS, extremes, headroom and frequency.
 void analyse(Reading *r) {
   r->bias = 0.0f;
   r->rms = 0.0f;
   r->min_counts = 0;
   r->max_counts = 0;
   r->n_clipped = 0;
+  r->asym = 0.0f;
+  r->headroom_warn = false;
   r->n_rise = 0;
   r->freq_hz = 0.0f;
   if (r->n <= 0) {
@@ -727,8 +1264,8 @@ void analyse(Reading *r) {
   //
   // The accumulator is double because the sum of squares reaches ~5e9, past
   // where a 32-bit float still resolves single units. There is no FPU here, so
-  // this is software arithmetic -- a thousand-odd operations once per request,
-  // which is nothing next to the window it just spent sampling.
+  // this is software arithmetic -- a thousand-odd operations once per window,
+  // which is nothing next to the time it just spent sampling.
   double sumsq = 0.0;
   for (int i = 0; i < r->n; i++) {
     double d = (double)sampleBuf[i] - (double)r->bias;
@@ -736,9 +1273,23 @@ void analyse(Reading *r) {
   }
   r->rms = (float)sqrt(sumsq / (double)r->n);
 
+  // Headroom: the swing above the bias against the swing below it. See ASYM_MIN
+  // for why this is a ratio about the MEASURED bias rather than a comparison
+  // against a hardcoded ceiling.
+  float pos = (float)r->max_counts - r->bias;
+  float neg = r->bias - (float)r->min_counts;
+  if (neg > 0.0f) {
+    r->asym = pos / neg;
+    // Only above FREQ_MIN_RMS. On a pump-off floor pos and neg are two or three
+    // counts of DNL-inflated noise and their ratio is a coin toss.
+    r->headroom_warn = (r->rms >= FREQ_MIN_RMS && r->asym < ASYM_MIN);
+  }
+
   // Pass 3: rising crossings of the bias, with a Schmitt band so noise around
   // the crossing is counted once rather than as a burst. The band scales with
-  // the signal -- a quarter of RMS sits well inside a sine's 1.41x RMS peak.
+  // the signal -- a quarter of RMS sits well inside a sine's 1.41x RMS peak, and
+  // therefore far below any flattening at the top of the wave, which is why soft
+  // clipping does not disturb freq_hz.
   //
   // Skipped entirely below FREQ_MIN_RMS. A flat, pump-off trace is a few counts
   // of ADC noise, and noise crosses any band this small over and over: measured,

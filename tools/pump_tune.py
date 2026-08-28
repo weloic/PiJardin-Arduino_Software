@@ -10,12 +10,19 @@ instead of hand-typed JSON and 400 numbers read off a terminal.
 
 Requires pyserial:  pip install pyserial
 
-    python tools/pump_tune.py status                 # identity, defaults, limits
+    python tools/pump_tune.py status                 # identity, defaults, detector state
     python tools/pump_tune.py probe                  # one window + quality checks
     python tools/pump_tune.py plot                   # waveform, for setting the pot
-    python tools/pump_tune.py watch                  # live readings, ~1/s
+    python tools/pump_tune.py watch                  # live polled readings, ~1/s
+    python tools/pump_tune.py listen                 # PUSHED events + heartbeats
+    python tools/pump_tune.py history                # replay the buffered transitions
     python tools/pump_tune.py calibrate              # guided; emits the #define block
     python tools/pump_tune.py raw '{"id":1,"cmd":"status"}'
+
+`listen` is the one to use for testing fw 2.x: from proto 2 the board decides
+state changes itself and PUSHES a line the moment it sees one, so `watch` (which
+polls) no longer shows what the board is actually reporting to the Pi. `listen`
+also flags gaps in `seq`, which is how a lost line is detected.
 
 The port is auto-detected when exactly one candidate is present; otherwise pass
 --port COM5 (Windows) or --port /dev/ttyACM0.
@@ -51,10 +58,29 @@ ADC_MAX = 4095
 BOARD_VIDS = (0x2E8A, 0x2886)  # Raspberry Pi, Seeed
 MID_SCALE = 2048
 
-# Mirrors FREQ_MIN_RMS in src/pump/pump_sensor.cpp. Kept here only to tell the
-# user when the firmware's value no longer suits their installation -- the board
-# does not report it, so this copy can drift; check it if the advice looks odd.
-FREQ_MIN_RMS_DEFAULT = 10.0
+# Fallbacks for the firmware constants this tool reasons about. From proto 2 the
+# board reports all three in `status` and BOARD below holds the real values, so
+# these are only used against an older firmware -- or before the handshake, in
+# `raw`. Anything reading them should go through board_const().
+FREQ_MIN_RMS_DEFAULT = 40.0   # FREQ_MIN_RMS
+ASYM_MIN_DEFAULT = 0.90       # ASYM_MIN -- see "the asym headroom check" in docs/pump.md
+
+# The highest count an LM358-based ZMPT101B can reach on a 3V3 supply, ~2.0 V.
+# On this installation the ADC rail is NOT the limit and gain advice measured
+# against 4095 is actively wrong -- see docs/pump.md. `plot --ceiling 0` turns it
+# off for a module that really can reach the rails.
+CEILING_DEFAULT = 2480
+
+# Filled in by main() from the board's own `status`, so nothing here has to keep
+# a second copy of a firmware constant that can drift out of date. Empty when the
+# handshake has not run (only `raw`).
+BOARD = {}
+
+
+def board_const(key, fallback):
+    """One firmware constant, preferring what the board actually reported."""
+    v = BOARD.get(key)
+    return fallback if v is None else v
 
 # The uncertain band must span at least this ratio for the 5x / div-3 rule to be
 # worth using. Below it the rule degenerates: it needs roughly 15x separation
@@ -163,63 +189,78 @@ def check(resp, mains_hz):
     # Clipping that happens BELOW the ADC rails, which n_clipped cannot see.
     #
     # The stock ZMPT101B is specified for 5-30 V and its LM358 cannot drive its
-    # output closer than ~1.3 V to its positive rail. Run from 3V3 it therefore
-    # flattens the top of the wave at ~2.0 V (~2480 counts) while the bottom half
-    # swings freely -- a distorted reading with n_clipped:0 and both rails
-    # untouched. Measured on this project's hardware: bias 2032, max 2476
-    # (+444), min 1480 (-552), rms 394 where a clean sine of that peak would
-    # give 352.
+    # output closer than ~1.3 V to its positive rail. On the 3V3 supply this
+    # installation uses it therefore flattens the top of the wave at ~2.0 V
+    # (~2480 counts) while the bottom half swings freely -- a distorted reading
+    # with n_clipped:0 and both rails untouched. Measured on this project's
+    # hardware: bias 2032, max 2476 (+444), min 1480 (-552), rms 394 where a
+    # clean sine of that peak would give 352.
     #
-    # Two independent symptoms, because either alone has innocent explanations:
-    # mains itself is often slightly flat-topped (odd harmonics from rectifier
-    # loads), but that distorts both halves EQUALLY, so asymmetry is what
-    # separates an op-amp running out of headroom from an ugly grid.
+    # From proto 2 the FIRMWARE runs this test itself and reports `asym`
+    # ((max-bias)/(bias-min), ~1.0 for a clean sine), so this uses the board's
+    # own figure and threshold rather than a second opinion that could disagree
+    # with the counter (`n_headroom`) the board is keeping. The fallback is for
+    # a proto 1 board.
+    #
+    # Direction matters and is why `asym` is a signed-in-effect ratio rather than
+    # a magnitude: flattening SUPPRESSES the positive side, so the compressed
+    # half is the SMALLER excursion and only asym < 1 is evidence of it. A lean
+    # the other way is ordinary harmonic content -- an earlier version of this
+    # tool warned on lopsidedness in either direction and told the user to
+    # "reduce the gain until the two swings match", which is unreachable advice:
+    # measured here, winding the gain down took rms 262 -> 206 while the lean
+    # went 15% -> 18%.
+    #
+    # rms/peak (`fullness`) is the second, independent symptom, and separates
+    # severity: flattening pushes it ABOVE the 0.707 of a sine (0.81 when this
+    # module was truly clipping). Mains itself is often slightly flat-topped from
+    # rectifier loads, but that distorts both halves equally.
     rms = resp.get("rms_counts", 0)
     lo, hi = resp.get("min_counts", 0), resp.get("max_counts", 0)
     pos, neg = hi - bias, bias - lo
     peak = (hi - lo) / 2.0
-    if rms > 50 and peak > 0 and max(pos, neg) > 0:
-        asym = abs(pos - neg) / max(pos, neg)
+    asym = resp.get("asym")
+    if asym is None and neg > 0:
+        asym = pos / neg
+    asym_min = board_const("asym_min", ASYM_MIN_DEFAULT)
+    # Same gate the firmware applies: below FREQ_MIN_RMS the extremes are a few
+    # counts of ADC noise and their ratio is a coin toss.
+    if (rms >= board_const("freq_min_rms", FREQ_MIN_RMS_DEFAULT)
+            and peak > 0 and asym is not None and asym > 0):
         fullness = rms / peak  # 0.707 for a sine, 1.0 for a square
-        if asym > 0.15 and fullness > 0.76:
+        if asym < asym_min and fullness > 0.76:
             volts = hi / 4095.0 * 3.3
-            target = int(MID_SCALE + 0.8 * (hi - MID_SCALE))
+            target = int(bias + 0.8 * (hi - bias))
             problems.append(
-                f"ASYMMETRIC CLIPPING: +{pos:.0f}/-{neg:.0f} counts about the bias "
-                f"({asym * 100:.0f}% lopsided) and rms/peak {fullness:.2f} vs 0.707 "
-                f"for a sine. The top is being flattened at {hi} counts (~{volts:.2f} V), "
-                f"well below the ADC rail -- so n_clipped cannot see it.\n"
-                f"      This is the LM358 out of headroom on a 3.3 V supply.\n"
+                f"SOFT CLIPPING (headroom): asym {asym:.2f} vs {asym_min:.2f} -- "
+                f"+{pos:.0f}/-{neg:.0f} counts about the bias, rms/peak {fullness:.2f} "
+                f"vs 0.707 for a sine. The top is being flattened at {hi} counts "
+                f"(~{volts:.2f} V), well below the ADC rail -- so n_clipped cannot see "
+                f"it.\n"
+                f"      This is the LM358 out of headroom on the 3.3 V supply. The pump "
+                f"is still unambiguously ON; what is wrong is the gain.\n"
                 f"      TURNING THE POT: a multi-turn pot gives no clue which way is "
                 f"'down', and max_counts is PINNED at the ceiling so it will not move "
                 f"whichever way you turn. Judge by these instead:\n"
-                f"        rms_counts must FALL   (rising = wrong way)\n"
+                f"        asym must RISE toward 1.00   (falling = wrong way)\n"
+                f"        rms_counts must FALL\n"
                 f"        bias_counts must climb back toward {MID_SCALE} "
                 f"(now {bias:.0f}; it sags because the clipped top drags the mean down)\n"
                 f"      Aim for max_counts near {target} with this warning gone. Watch it "
                 f"live while turning:  pump_tune.py watch\n"
-                f"      Or fix it properly: VCC to 5V, OUT divided 2:1 -- see docs/pump.md."
+                f"      Do NOT move the module to 5 V or add a divider to fix this -- "
+                f"that invalidates every calibrated threshold. See docs/pump.md."
             )
-        elif asym > 0.15 and fullness > 0.72:
+        elif asym < asym_min:
             problems.append(
-                f"waveform is lopsided about the bias: +{pos:.0f}/-{neg:.0f} counts, "
-                f"and rms/peak {fullness:.2f} is starting to climb above the 0.707 of a "
-                f"sine. Approaching the flattening described in docs/pump.md -- do not "
-                f"raise the gain further."
+                f"asym {asym:.2f} is below the firmware's {asym_min:.2f}, but rms/peak "
+                f"{fullness:.2f} has not reached the 0.76 that marks a squared-off wave "
+                f"(a sine is 0.707). Approaching the flattening described in "
+                f"docs/pump.md -- do not raise the gain further. The board is counting "
+                f"this window in n_headroom."
             )
-        # No warning for asymmetry with fullness at or below ~0.72. A real mains
-        # waveform is not a textbook sine -- harmonics from every rectifier on the
-        # circuit lean it, commonly 15-20%, and NO gain setting removes that.
-        #
-        # An earlier version warned on asymmetry alone and told the user to
-        # "reduce the gain until the two swings match", which is unreachable
-        # advice: measured on this installation, winding the gain down took rms
-        # 262 -> 206 while the lean went 15% -> 18%. Two things separate the
-        # benign case from clipping, and both were visible in that data:
-        #   - direction: flattening SUPPRESSES one side, so the clipped side is
-        #     the SMALLER excursion. Here the larger side was the positive one.
-        #   - fullness: flattening pushes rms/peak ABOVE 0.707 (0.81 when this
-        #     module was truly clipping). Benign asymmetry sits at or below it.
+        # No warning above asym_min. A real mains waveform is not a textbook
+        # sine, and no gain setting removes the harmonics that lean it.
 
     if resp.get("truncated"):
         problems.append(
@@ -264,12 +305,18 @@ def summarise(resp, mains_hz, prefix=""):
               f"field={resp.get('field', '-')}  bias={resp.get('bias_counts', 0):.0f}")
     else:
         vrms = f"  vrms={resp['vrms']:.1f}V" if "vrms" in resp else ""
+        # asym rides alongside n_clipped everywhere, because on this front end it
+        # is the one that actually fires: clip counts the ADC rails, asym catches
+        # the LM358 ceiling hundreds of counts below them.
+        asym = resp.get("asym")
+        asym_s = f"{asym:5.2f}" if asym is not None else "    -"
         print(
             f"{prefix}state={resp.get('state', '?'):<9} "
             f"rms={resp.get('rms_counts', 0):8.2f}  "
             f"bias={resp.get('bias_counts', 0):7.1f}  "
             f"min/max={resp.get('min_counts', 0)}/{resp.get('max_counts', 0)}  "
             f"clip={resp.get('n_clipped', 0)}  "
+            f"asym={asym_s}  "
             f"freq={resp.get('freq_hz', 0):6.2f}Hz  "
             f"late={resp.get('max_late_us', 0)}us{vrms}"
         )
@@ -410,12 +457,17 @@ def cmd_plot(board, args):
     resp = board.request("sampling", dump_n=args.dump_n, **sample_args(args))
     summarise(resp, args.mains_hz)
     print()
+    # --ceiling 0 means "the ADC rails really are the limit", for a rail-to-rail
+    # module or one on a proper 5 V supply. The default is the LM358-at-3V3
+    # ceiling, because that is what is installed.
     ascii_plot(resp.get("samples", []), bias=resp.get("bias_counts"),
-               ceiling=args.ceiling)
+               ceiling=(args.ceiling or None))
 
 
 def cmd_watch(board, args):
-    print("Ctrl-C to stop. Switch the pump on and off and watch rms move.\n")
+    print("Ctrl-C to stop. Switch the pump on and off and watch rms move.")
+    print("This POLLS, so `state` here is one unlatched window -- it is the view to set")
+    print("the pot by, not what the board reports to the Pi. For that, use `listen`.\n")
     try:
         while True:
             resp = board.request(args.cmd, **sample_args(args))
@@ -423,6 +475,150 @@ def cmd_watch(board, args):
             time.sleep(args.interval)
     except KeyboardInterrupt:
         print("\nstopped")
+
+
+def fmt_event(msg, asym_min):
+    """One pushed event line, rendered for a human. Returns (text, warnings)."""
+    ev = msg.get("ev", "?")
+    warn = []
+
+    asym = msg.get("asym")
+    asym_s = f"{asym:5.2f}" if asym is not None else "    -"
+    head = (f"seq={msg.get('seq', '?'):<6} {ev:<4} "
+            f"state={str(msg.get('state', '?')):<8} "
+            f"rms={msg.get('rms_counts', 0):8.2f}  "
+            f"freq={msg.get('freq_hz', 0):6.2f}Hz  "
+            f"asym={asym_s}")
+
+    if ev == "pump":
+        prev = msg.get("prev_state", "?")
+        held = msg.get("ms", 0) - msg.get("prev_ms", 0)
+        head += f"   <- {prev} after {held / 1000.0:.1f}s"
+        if msg.get("state") == "fault":
+            warn.append("FAULT: the bias left the plausible window -- the module is not "
+                        "reporting. This is NOT a stopped pump; check the A0 wire and 3V3.")
+    elif ev == "hb":
+        head += (f"   since={msg.get('since_ms', 0) / 1000.0:6.0f}s"
+                 f"  dropped={msg.get('dropped', 0)}"
+                 f"  freq_rej={msg.get('n_freq_reject', 0)}"
+                 f"  headroom={msg.get('n_headroom', 0)}")
+        if msg.get("dropped", 0):
+            warn.append(f"{msg['dropped']} event line(s) dropped since boot -- the host "
+                        f"was not reading and the board refused to block on it. Any "
+                        f"TRANSITIONS among them are still in the ring buffer "
+                        f"(`pump_tune.py history`); dropped heartbeats are just gone, "
+                        f"and carried nothing this line does not.")
+        if msg.get("n_freq_reject", 0):
+            warn.append(f"{msg['n_freq_reject']} window(s) were loud enough for ON at the "
+                        f"wrong frequency -- induced hum or pickup rather than the feed.")
+        if msg.get("n_headroom", 0):
+            warn.append(f"{msg['n_headroom']} window(s) flagged by the headroom check "
+                        f"(asym < {asym_min:.2f}) -- turn the gain pot DOWN.")
+
+    if asym is not None and 0 < asym < asym_min and msg.get("rms_counts", 0) >= \
+            board_const("freq_min_rms", FREQ_MIN_RMS_DEFAULT):
+        warn.append(f"asym {asym:.2f} < {asym_min:.2f}: the LM358 is flattening the top of "
+                    f"the wave. Still unambiguously ON -- but turn the pot down.")
+    return head, warn
+
+
+def cmd_listen(board, args):
+    """Print pushed events as they arrive. The test harness for the push path.
+
+    Deliberately NOT built on Board.request: nothing here is solicited, so there
+    is no id to correlate on. Correlation is `seq`, and a gap in it is the only
+    evidence the Pi ever gets that a line was lost -- so flagging it is the
+    point of this command rather than a nicety.
+    """
+    hb_s = board_const("hb_ms", 60000) / 1000.0
+    asym_min = board_const("asym_min", ASYM_MIN_DEFAULT)
+    # The resolution floor, computed from what the board reports rather than
+    # quoted: window width x debounce count. Anything shorter is not resolved.
+    window_s = board_const("detect_cycles", 10) / args.mains_hz
+    print(f"Listening. Heartbeat every {hb_s:.0f}s; a transition is declared after "
+          f"{board_const('debounce', 3)} x {window_s * 1000:.0f} ms "
+          f"= {board_const('debounce', 3) * window_s:.1f}s of agreement.")
+    print("Switch the pump on and off. Ctrl-C to stop.\n")
+
+    # Start from the seq `status` just reported, so a transition that happened
+    # between the handshake and the first line read is reported as a gap rather
+    # than silently skipped. It is a real gap in what this tool saw.
+    last_seq = BOARD.get("seq")
+    board.ser.timeout = 1.0
+    try:
+        while True:
+            raw = board.ser.readline()
+            if not raw:
+                continue
+            text = raw.decode(errors="replace").strip()
+            if not text:
+                continue
+            stamp = time.strftime("%H:%M:%S  ")
+            try:
+                msg = json.loads(text)
+            except json.JSONDecodeError:
+                print(f"{stamp}?  {text}")  # line noise, or a partial line on connect
+                continue
+
+            if msg.get("type") == "ready":
+                # The board rebooted (watchdog, power, or a reflash). seq restarts
+                # at 0 and the ring buffer is empty, so previous state is gone.
+                print(f"{stamp}** BOARD RESET: {text}")
+                print(f"{stamp}   seq restarts at 0; history is empty; state is 'unknown'")
+                last_seq = None
+                continue
+            if msg.get("type") != "event":
+                print(f"{stamp}   {text}")  # a reply to something else on this port
+                continue
+
+            seq = msg.get("seq")
+            if isinstance(seq, int) and isinstance(last_seq, int) and seq != last_seq + 1:
+                missing = seq - last_seq - 1
+                print(f"{stamp}!! SEQ GAP: {missing} event line(s) not seen "
+                      f"({last_seq} -> {seq}).")
+                print(f"{stamp}   Transitions are still buffered: "
+                      f"pump_tune.py history --after-seq {last_seq}")
+            last_seq = seq
+
+            head, warn = fmt_event(msg, asym_min)
+            print(f"{stamp}{head}")
+            for w in warn:
+                print(f"    ! {w}")
+    except KeyboardInterrupt:
+        print("\nstopped")
+
+
+def cmd_history(board, args):
+    """Replay the board's ring buffer of transitions.
+
+    Pages until `more` clears, because one reply is capped at 8 events.
+    """
+    after = args.after_seq
+    total = 0
+    while True:
+        resp = board.request("history", after_seq=after)
+        if resp.get("status") != "ok":
+            print(f"  ERROR {resp.get('code')} {resp.get('field', '')}".rstrip())
+            return
+        events = resp.get("events", [])
+        if resp.get("truncated"):
+            print(f"  ! TRUNCATED: transitions after seq {after} have already been "
+                  f"overwritten and are permanently gone.")
+            print(f"  ! The buffer holds {board_const('history_max', '?')} events; this is "
+                  f"what a Pi outage longer than that looks like.")
+        for e in events:
+            print(f"  seq={e.get('seq'):<6} {str(e.get('state', '?')):<8} "
+                  f"ms={e.get('ms')}")
+            total += 1
+        if not resp.get("more") or not events:
+            break
+        after = events[-1].get("seq")
+
+    if total == 0:
+        print("  (no transitions buffered past that seq -- the board has not seen one,")
+        print("   or it has rebooted since. Nothing is persisted to flash by design.)")
+    print(f"\n  {total} transition(s); history_max={board_const('history_max', '?')}, "
+          f"board seq={BOARD.get('seq', '?')}")
 
 
 def collect(board, args, n, label):
@@ -500,10 +696,11 @@ def cmd_calibrate(board, args):
     # here: floor 12.9 against the 10.0 default, yielding 307/425/393/328/341 Hz
     # across five windows -- wandering like that is the signature of no real
     # periodicity, which is exactly what this guard exists to suppress.
-    if rms_off >= FREQ_MIN_RMS_DEFAULT:
+    freq_min = board_const("freq_min_rms", FREQ_MIN_RMS_DEFAULT)
+    if rms_off >= freq_min:
         want = max(20, int(round(rms_off * 3 / 10.0)) * 10)
         freqs = ", ".join(f"{r.get('freq_hz', 0):.0f}" for r in off_resps)
-        print(f"\n  ! FREQ_MIN_RMS in the firmware is {FREQ_MIN_RMS_DEFAULT:.1f}, BELOW this "
+        print(f"\n  ! FREQ_MIN_RMS in the firmware is {freq_min:.1f}, BELOW this "
               f"floor of {rms_off:.2f}, so the")
         if coupled:
             print(f"  ! board reports a frequency with the pump stopped. Here that is real "
@@ -584,9 +781,20 @@ def cmd_raw(board, args):
     deadline = time.time() + 10.0
     while time.time() < deadline:
         raw = board.ser.readline()
-        if raw:
-            print(raw.decode(errors="replace").rstrip())
-            return
+        if not raw:
+            continue
+        text = raw.decode(errors="replace").rstrip()
+        # From proto 2 an unsolicited event can land between the request and its
+        # reply. Printing one and stopping would look like the board answered
+        # something else entirely, so they are labelled and skipped over.
+        try:
+            if json.loads(text).get("type") == "event":
+                print(f"(event) {text}")
+                continue
+        except json.JSONDecodeError:
+            pass
+        print(text)
+        return
     print("(no reply within 10 s)")
 
 
@@ -654,16 +862,28 @@ def main():
     p = sub.add_parser("plot")
     p.add_argument("--dump-n", type=int, default=200)
     p.add_argument(
-        "--ceiling", type=int, metavar="COUNTS",
-        help="highest count the module can actually reach, when that is lower "
-             "than the ADC rail -- e.g. ~2450 for an LM358 module run at 3V3. "
-             "Gain advice is measured against this instead of 4095.")
+        "--ceiling", type=int, metavar="COUNTS", default=CEILING_DEFAULT,
+        help=f"highest count the module can actually reach, when that is lower "
+             f"than the ADC rail. Defaults to {CEILING_DEFAULT} -- the LM358 "
+             f"ceiling on the documented 3V3 rig, where 4095 is not the limit "
+             f"and gain advice measured against it is wrong. Pass 0 for a module "
+             f"that really can reach the rails.")
     p.set_defaults(func=cmd_plot)
 
     p = sub.add_parser("watch")
     p.add_argument("--interval", type=float, default=1.0)
     p.add_argument("--cmd", default="sampling", choices=["sampling", "read_pump"])
     p.set_defaults(func=cmd_watch)
+
+    # `follow` is the same thing under the name people reach for first.
+    for name in ("listen", "follow"):
+        sub.add_parser(name).set_defaults(func=cmd_listen)
+
+    p = sub.add_parser("history")
+    p.add_argument("--after-seq", type=int, default=0,
+                   help="only transitions with a seq greater than this; "
+                        "0 (the default) means everything still buffered")
+    p.set_defaults(func=cmd_history)
 
     p = sub.add_parser("calibrate")
     p.add_argument("--repeat", type=int, default=5, help="windows per state")
@@ -682,8 +902,23 @@ def main():
             ident = board.request("status")
             if ident.get("role") != "pump":
                 sys.exit(f"{port} is a '{ident.get('role')}' board, not the pump sensor")
+            # The board publishes its own constants from proto 2, so every check
+            # below measures against what is actually flashed rather than a copy
+            # in this file that can drift.
+            BOARD.clear()
+            BOARD.update(ident)
             print(f"# {port}  role={ident['role']}  fw={ident['fw']}  "
-                  f"proto={ident['proto']}  up={ident['uptime_ms']}ms\n")
+                  f"proto={ident['proto']}  up={ident['uptime_ms']}ms")
+            if "state" in ident:
+                print(f"# detector: state={ident['state']} "
+                      f"since={ident.get('since_ms', 0) / 1000.0:.1f}s "
+                      f"seq={ident.get('seq')} dropped={ident.get('dropped')} "
+                      f"freq_rej={ident.get('n_freq_reject')} "
+                      f"headroom={ident.get('n_headroom')}")
+            else:
+                print("# NOTE: this board predates proto 2 -- it does not push events, "
+                      "and `listen` will show nothing.")
+            print()
         args.func(board, args)
     finally:
         board.close()
