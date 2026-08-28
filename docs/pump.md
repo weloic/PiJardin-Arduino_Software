@@ -72,7 +72,8 @@ making it return the latched verdict instead would break calibration.
 | ZMPT101B `OUT` | `A0` | GPIO26 = ADC0 — **direct, no divider** |
 | ZMPT101B `VCC` | `3V3` | **not 5V** — see below |
 | ZMPT101B `GND` | `GND` | |
-| Status LED | `LED_BUILTIN` | GPIO17, the red LED; lit while a command is served |
+| Status LED | `PIN_LED_R/G/B` | GPIO17/16/25, the 3-in-1 user LED; shows the **detector state** by colour — see below |
+| NeoPixel | GPIO12, GPIO11 | unused, **held dark** — see below |
 
 ```
   ZMPT101B VCC ──── XIAO 3V3
@@ -80,9 +81,64 @@ making it return the latched verdict instead would break calibration.
   ZMPT101B OUT ──── XIAO A0
 ```
 
-The XIAO RP2040's user LEDs are **active low** — the pin is pulled low to light them. The firmware
-uses `LED_ON`/`LED_OFF` rather than `HIGH`/`LOW` for exactly this reason; drive it the intuitive way
-round and the LED is on when idle and dark when working, which reads as a hung board.
+### Status LED
+
+The LED answers the question you actually have standing in front of the board: **is the pump
+running?** It says it in **colour**, on the 3-in-1 user LED.
+
+| Colour | Pattern | Meaning |
+| --- | --- | --- |
+| 🟢 green | solid | pump **`on`** |
+| 🟢 green | 60 ms blip every 3 s | pump **`off`**, board alive |
+| 🔵 blue | blink, 2 Hz | **undecided** — `unknown` at boot, or a change part way through its debounce |
+| 🔴 red | blink, 10 Hz | **`fault`** — the module is not reporting |
+| ⚫ dark | — | **the board is not running** |
+
+Exactly one die is ever lit. Two at once would be a third colour and a fourth thing to learn.
+
+#### ⚠️ All four LEDs are now driven, including the ones that are not used
+
+The XIAO RP2040 carries **four user-visible LEDs**: the three dice of the user LED (red GPIO17,
+green GPIO16, blue GPIO25) and a WS2812 "NeoPixel" (data GPIO12, power GPIO11). Up to fw 2.0.0 this
+firmware drove only the red die.
+
+**Leaving the rest uninitialised does not leave them off.** An uninitialised pin is an *input*, and
+these LEDs are wired to 3V3 through their anodes — a floating cathode leaks enough to sit lit or
+glowing. The result was three or four LEDs on at once, and the one that meant something lost among
+them. Every LED the firmware does not use is now explicitly driven off at boot, and the NeoPixel is
+held unpowered *and* with its data line low, so it cannot latch noise as a colour.
+
+The NeoPixel is deliberately not used as the indicator: it needs a library and ~30 µs of bit-banging
+with interrupts off per update, and three plain GPIOs say the same thing without going near the
+timing this firmware's sampling depends on.
+
+#### Why the two awkward-looking choices
+
+**`fault` is red, not dark.** Dark is what `off` would otherwise be, and leaving them the same
+reintroduces — on the one output a person actually looks at — exactly the conflation that the bias
+plausibility window, the `sensor_fault` code and the `fault` state all exist to prevent.
+
+**`off` is a blip, not dark.** Same reason the protocol has a [heartbeat](#events-board--pi-unsolicited):
+silence has to mean one thing. A dark LED must mean *this board is not running*, and it cannot mean
+that if it also means *the pump is stopped* — the state the board will legitimately sit in for most
+of the year. The blip is short enough not to compete with anything and long enough to see. It is one
+constant (`LED_ALIVE_FLASH_MS`) if you would rather it were dark.
+
+**A reading in the hysteresis band does not blink.** The board holds its state through that band on
+purpose and is entirely certain of the answer it is giving; blinking there would advertise doubt the
+design does not have, and make a correctly-working detector look flaky. Blue means *not committed* —
+no state yet, or one being confirmed. The old per-window `"uncertain"` verdict is still on
+`read_pump` for anyone who wants the raw view.
+
+> **This replaced the fw 1.x busy indicator**, which lit the LED while a command was being served.
+> That made sense when the board idled between requests. It now measures continuously, so "lit while
+> working" would mean "lit always" — and a `sampling` call would hold it solid for 1.2 s looking
+> exactly like a running pump. One indicator cannot say both things.
+
+The XIAO RP2040's user LEDs are **active low** — the pin is pulled low to light a die. The firmware
+uses `LED_ON`/`LED_OFF` rather than `HIGH`/`LOW` for exactly this reason; drive them the intuitive
+way round and every colour above inverts *and* all three light at once, which is the muddle this
+replaced.
 
 The module's **multi-turn potentiometer** sets its output gain. It ships at an arbitrary position
 and must be adjusted — see [Calibration](#calibration-required).
@@ -652,6 +708,9 @@ Serial monitor at 9600 baud (or `pump_tune.py listen`), reset the board.
 
 1. **Banner** → `{"type":"ready","proto":2,"fw":"2.0.0","role":"pump"}`. May be missed — native USB
    does not reset on port open. Not a fault; use `status`.
+   - **Look at the board.** Exactly **one** LED should be doing anything: the user LED, blue at
+     2 Hz. If the NeoPixel or a second colour is also lit, the firmware on the board predates this
+     change — everything unused is driven off at boot.
 2. `{"id":1,"cmd":"status"}` → `ok` with the defaults and limits (`adc_bits:12`, `max_samples:1200`,
    `rate_hz_default:2000`, `line_max:192`) **and** the detector block (`state`, `since_ms`, `seq`,
    `debounce:3`, `hb_ms:60000`, `history_max:32`).
@@ -662,6 +721,9 @@ Serial monitor at 9600 baud (or `pump_tune.py listen`), reset the board.
 4. **A real transition** — switch the pump on. Expect an `ev:"pump"` line with `"state":"on"`,
    `prev_state:"off"`, within roughly 600–800 ms. Switch it off and expect the mirror image.
    Check `prev_ms` matches the `ms` of the previous transition.
+   - **Watch the LED while you do it.** Blue at 2 Hz for the ~600 ms the change is being debounced,
+     then solid green (on) or the green blip (off). At reset it is blue until the first state is
+     declared. This is the whole state machine visible without a serial port.
 5. **Debounce holds** — flick the pump on and straight back off in under half a second. Expect
    **no** event. That is the resolution floor doing its job, not a miss.
 6. **Sampling quality** — `{"id":2,"cmd":"sampling","dump_n":0}` with the pump running:
@@ -675,7 +737,9 @@ Serial monitor at 9600 baud (or `pump_tune.py listen`), reset the board.
    nothing else in this checklist will catch that.
 8. **Sensor fault, the important one** — **unplug the `A0` signal wire**. Expect `sensor_fault` from
    `read_pump`, and within ~600 ms an event with `"state":"fault"` — *not* `"off"`: a disconnected
-   sensor must not look like a stopped pump. Reconnect and confirm it recovers with another event.
+   sensor must not look like a stopped pump. **The LED must go red at 10 Hz, not dark** — same rule,
+   on the output you can see from across the room. Reconnect and confirm it recovers with another
+   event.
    - Also unplug the module's `3V3`: also `fault`.
    - Run `sampling` in each case and read `bias_counts` / `bias_ok` to see why.
 9. **History** — after a few transitions, `{"id":4,"cmd":"history"}` → the buffered events oldest

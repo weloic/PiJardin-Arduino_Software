@@ -73,9 +73,19 @@ the `.ino` step ever added.
 
 Both boards are in the **Seeed Studio XIAO** form factor with native USB, but they are different
 chips: the well sensor is a **XIAO SAMD21** (Atmel, Cortex-M0+) and the pump sensor is a **XIAO
-RP2040** (Raspberry Pi, dual Cortex-M0+). On both, the status LED lights while a command is being
-processed — note that the RP2040's user LEDs are **active low**, which the pump firmware accounts
-for.
+RP2040** (Raspberry Pi, dual Cortex-M0+).
+
+Their status LEDs no longer mean the same thing. On the **well sensor** it lights while a command is
+being processed. On the **pump sensor** it shows the detector's state **in colour** — solid green
+for on, a green blip every 3 s for off, blue while undecided, red for a sensor fault
+([docs/pump.md](docs/pump.md#status-led)) — because that board measures continuously, so a busy
+indicator would simply be lit all the time.
+
+> ⚠️ **The XIAO RP2040 has four user-visible LEDs** (the three dice of the user LED on GPIO17/16/25,
+> plus a NeoPixel on GPIO12/11), and **leaving the unused ones uninitialised does not leave them
+> off** — an uninitialised pin is an input, and these LEDs are wired to 3V3, so a floating cathode
+> glows. The pump firmware drives every one of them explicitly at boot for that reason. Note also
+> that the RP2040's user LEDs are **active low**.
 
 > ⚠️ **Both are 3.3 V parts and neither is 5 V tolerant.** The SAMD21's ADC reference is
 > `VDDANA` = 3.3 V; the RP2040's is 3.3 V likewise. Any sensor module with an analog output must be

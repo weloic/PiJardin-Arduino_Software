@@ -117,13 +117,62 @@
 // 5 V tolerant.)
 #define VPIN A0
 
-// GPIO17, the red user LED. THE XIAO RP2040'S USER LEDS ARE ACTIVE LOW -- the
-// pin is pulled low to light them. Driving this the intuitive way round would
-// leave the LED on whenever the board is idle and dark while it is working,
-// which is backwards for a busy indicator and reads as a hung board.
-#define LEDPIN LED_BUILTIN
+// --- Status LED --------------------------------------------------------------
+// THE XIAO RP2040 HAS FOUR USER-VISIBLE LEDS, and every one of them has to be
+// accounted for. Up to fw 2.0.0 this firmware drove exactly one -- the red die
+// on GPIO17 -- and left the rest uninitialised. An uninitialised pin is an
+// INPUT, and these LEDs are wired to 3V3 through their anodes, so a floating
+// cathode leaks enough to sit lit or glowing. The result was three or four LEDs
+// on at once and no way to tell which one was saying anything.
+//
+//   GPIO17 / GPIO16 / GPIO25   red / green / blue dice of the 3-in-1 user LED
+//   GPIO12 + GPIO11            WS2812 "NeoPixel", data + power enable
+//
+// So: every LED this firmware does not use is explicitly driven OFF at boot (see
+// ledBegin), and because the three dice share one package, the indicator is a
+// COLOUR rather than a blink rate. Colour is what makes it legible from across
+// the plant room: telling 2 Hz from 10 Hz means standing and watching for a
+// second, telling green from red does not.
+//
+// ACTIVE LOW -- the pin is pulled low to light the die. Driving these the
+// intuitive way round inverts everything below AND lights all three at once,
+// which is the muddle this replaced.
+#define LED_R_PIN PIN_LED_R          // GPIO17
+#define LED_G_PIN PIN_LED_G          // GPIO16
+#define LED_B_PIN PIN_LED_B          // GPIO25
 #define LED_ON LOW
 #define LED_OFF HIGH
+
+// What the colours mean. Exactly one die is ever lit, which is what keeps this
+// readable -- two at once is a third colour and a fourth thing to learn.
+//
+//   green, solid                  pump ON
+//   green, 60 ms blip every 3 s   pump OFF, board alive
+//   blue,  2 Hz                   UNDECIDED -- `unknown` at boot, or a change
+//                                 part way through its debounce. See updateLed()
+//                                 for why the hysteresis band is NOT undecided.
+//   red,   10 Hz                  FAULT -- the module is not reporting
+//   dark                          THE BOARD IS NOT RUNNING
+//
+// Two of those choices are load-bearing:
+//
+// `fault` is red rather than dark, because dark is what `off` would otherwise
+// be. Leaving them the same would put back -- on the one output a person
+// actually looks at -- exactly the conflation the bias plausibility window, the
+// sensor_fault code and the `fault` state all exist to prevent.
+//
+// `off` is a blip rather than dark for the same reason the protocol has a
+// heartbeat: silence has to mean one thing. A dark LED must mean "this board is
+// not running", and it cannot mean that if it also means "the pump is stopped",
+// which is the state it will legitimately sit in for most of the year. The blip
+// is short enough not to compete with anything and long enough to see.
+#define LED_UNDECIDED_MS 250         // half-period -> 2 Hz
+#define LED_FAULT_MS 50              // half-period -> 10 Hz
+#define LED_ALIVE_PERIOD_MS 3000     // "still here" blip, pump off
+#define LED_ALIVE_FLASH_MS 60
+
+// One die at a time; LED_NONE is all three off.
+enum LedColour { LED_NONE = 0, LED_RED, LED_GREEN, LED_BLUE };
 
 // --- Protocol / firmware identity -------------------------------------------
 // proto is numbered per firmware, not per repo: this board shares the well
@@ -445,6 +494,11 @@ static uint8_t histCount = 0;           // entries currently held
 static uint8_t histHead = 0;            // next write slot (and the oldest, once full)
 static uint32_t histEvictedSeq = 0;     // seq of the newest entry ever overwritten
 
+// Colour currently shown, so updateLed() can be called as often as it likes --
+// it is polled from inside the sampling loop -- without touching three GPIOs on
+// every one of the several hundred calls per window.
+static LedColour ledShown = LED_NONE;
+
 // --- Prototypes --------------------------------------------------------------
 bool hasContent();
 void handleLine(const char *line);
@@ -468,6 +522,9 @@ void sampleWindow(Reading *r, const SampleParams *p);
 void analyse(Reading *r);
 void serviceSerial();
 void stepDetector();
+void ledBegin();
+void ledWrite(LedColour c);
+void updateLed();
 void resetDebounce();
 void declareState(DetState s, const Reading *r);
 void emitHeartbeat(const Reading *r);
@@ -485,8 +542,7 @@ void setup() {
 
   Serial.begin(9600);
 
-  pinMode(LEDPIN, OUTPUT);
-  digitalWrite(LEDPIN, LED_OFF);
+  ledBegin();
 
   setDefaults(&detParams);
   detParams.cycles = DETECT_CYCLES;
@@ -518,6 +574,7 @@ void setup() {
 // nothing, and a missed window costs a transition.
 void loop() {
   rp2040.wdt_reset();
+  updateLed();
   serviceSerial();
   stepDetector();
 }
@@ -561,14 +618,16 @@ bool hasContent() {
 }
 
 // Parse one request line and dispatch to the matching handler.
+//
+// Note what is NOT here any more: this used to light the LED for the duration of
+// the request. The LED now belongs to the detector -- see the colour table by
+// LED_R_PIN. One indicator cannot say "busy" as well, and on a board that
+// measures continuously "busy" would simply be always.
 void handleLine(const char *line) {
-  digitalWrite(LEDPIN, LED_ON);  // lit while the request is being served
-
   JsonDocument req;
   DeserializationError err = deserializeJson(req, line);
   if (err) {
     sendError(nullptr, "bad_request", nullptr);
-    digitalWrite(LEDPIN, LED_OFF);
     return;
   }
 
@@ -578,7 +637,6 @@ void handleLine(const char *line) {
   JsonVariantConst id = req["id"];
   if (!id.is<long>()) {
     sendError(nullptr, "bad_id", nullptr);
-    digitalWrite(LEDPIN, LED_OFF);
     return;
   }
 
@@ -596,8 +654,6 @@ void handleLine(const char *line) {
   } else {
     sendError(&id, "unknown_cmd", nullptr);
   }
-
-  digitalWrite(LEDPIN, LED_OFF);
 }
 
 // --- Command handlers --------------------------------------------------------
@@ -1044,6 +1100,86 @@ bool emitUnsolicited(const JsonDocument &doc, bool count_drop) {
 
 // --- Detector ----------------------------------------------------------------
 
+// Claim every LED on the board, including the ones this firmware will never use.
+//
+// Leaving a pin uninitialised is not "leaving it alone" -- it leaves an input
+// floating against an LED tied to 3V3, which glows. Four LEDs competing is how
+// an indicator stops being one, so the unused ones are driven off here and stay
+// off. This is the fix that makes the colour scheme above worth having.
+void ledBegin() {
+  pinMode(LED_R_PIN, OUTPUT);
+  pinMode(LED_G_PIN, OUTPUT);
+  pinMode(LED_B_PIN, OUTPUT);
+  ledWrite(LED_NONE);
+  ledShown = LED_NONE;
+
+  // The WS2812 is not used and is parked dark rather than left to chance: at
+  // cold boot it comes up with whatever happens to be in its shift register.
+  // Both pins, deliberately -- cutting its power is what actually turns it off
+  // (GPIO11 high is what Seeed's own examples use to enable it), and holding the
+  // data line low means that if it is somehow powered anyway it sees a
+  // permanent reset rather than noise it might latch as a colour.
+  //
+  // If one ever IS wanted here, it needs a library and ~30 us of bit-banging
+  // with interrupts off per update -- which is why it is dark instead: three
+  // plain GPIOs say the same thing without going anywhere near the timing this
+  // firmware's sampling depends on.
+  pinMode(NEOPIXEL_POWER, OUTPUT);
+  digitalWrite(NEOPIXEL_POWER, LOW);
+  pinMode(PIN_NEOPIXEL, OUTPUT);
+  digitalWrite(PIN_NEOPIXEL, LOW);
+}
+
+// Light exactly one die, or none.
+void ledWrite(LedColour c) {
+  digitalWrite(LED_R_PIN, (c == LED_RED) ? LED_ON : LED_OFF);
+  digitalWrite(LED_G_PIN, (c == LED_GREEN) ? LED_ON : LED_OFF);
+  digitalWrite(LED_B_PIN, (c == LED_BLUE) ? LED_ON : LED_OFF);
+}
+
+// Drive the status LED from the detector's state. See the colour table above.
+//
+// WHAT COUNTS AS UNDECIDED, and what deliberately does not. The blue blink means
+// the board is not committed to a state: either `unknown`, which is the boot
+// state it has no honest way out of yet, or a candidate change part way through
+// its debounce, which is a change being confirmed.
+//
+// A window that lands in the hysteresis band is NOT undecided and does not
+// blink. That band is the whole point of the latch -- the board holds its state
+// through it, on purpose, and is entirely certain of the answer it is giving.
+// Blinking there would advertise doubt the design does not have, and worse,
+// would make a correctly-working detector look flaky to anyone watching it. The
+// old proto-1 "uncertain" verdict is still on `read_pump` for anyone who wants
+// the raw per-window view; it is not a state, so it is not on the LED.
+//
+// Called from the top of loop() and from inside the sampling loop's pacing spin,
+// because loop() alone runs once per 200 ms window and could not resolve a 10 Hz
+// blink at all. The spin is idle time that is already being waited out, so this
+// costs nothing: it runs BEFORE the sample is due, not after it, and any overrun
+// it could ever cause would show up in max_late_us.
+void updateLed() {
+  uint32_t now = millis();
+  LedColour want;
+
+  if (detState == ST_FAULT) {
+    want = ((now / LED_FAULT_MS) & 1) ? LED_RED : LED_NONE;
+  } else if (detState == ST_UNKNOWN || detPending != detState) {
+    want = ((now / LED_UNDECIDED_MS) & 1) ? LED_BLUE : LED_NONE;
+  } else if (detState == ST_ON) {
+    want = LED_GREEN;
+  } else {
+    // ST_OFF: the "still here" blip. Same green as ON, because it is the same
+    // healthy board -- a blip against a solid light is not a distinction anyone
+    // has to be taught.
+    want = ((now % LED_ALIVE_PERIOD_MS) < LED_ALIVE_FLASH_MS) ? LED_GREEN : LED_NONE;
+  }
+
+  if (want != ledShown) {
+    ledShown = want;
+    ledWrite(want);
+  }
+}
+
 // Forget any part-accumulated candidate and start counting again from the
 // current state.
 //
@@ -1206,7 +1342,11 @@ void sampleWindow(Reading *r, const SampleParams *p) {
     // Signed difference so the comparison survives the micros() wrap at ~71
     // minutes; the whole window is at most a couple of seconds wide.
     while ((long)(micros() - due) < 0) {
-      // spin
+      // Not idle spin any more: this is where the blink gets its resolution,
+      // because loop() runs only once per window. Safe here precisely because it
+      // happens while WAITING for `due` rather than after the sample -- the
+      // schedule is absolute, so this eats slack, not spacing.
+      updateLed();
     }
     unsigned long late = (unsigned long)(long)(micros() - due);
     if (late > r->max_late_us) r->max_late_us = late;
