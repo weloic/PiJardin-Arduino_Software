@@ -123,7 +123,7 @@ the Pi can correlate replies and ignore stray lines; sensor failures are reporte
   identify what it is talking to from any reply, not just the banner.
 - **Boot banner:** on reset the board prints one line and nothing else until commanded:
   ```json
-  {"type":"ready","proto":2,"fw":"2.2.0","role":"puit"}
+  {"type":"ready","proto":2,"fw":"2.3.0","role":"puit"}
   ```
   The Pi resets the board (DTR toggle) and waits for a line that parses to JSON with
   `type == "ready"` before issuing commands. `role` says which board answered — check it
@@ -140,11 +140,20 @@ the Pi can correlate replies and ignore stray lines; sensor failures are reporte
 
 - `id` — a request counter chosen by the Pi, **required and must be an integer**; echoed back
   verbatim. A missing or mistyped `id` is `bad_id`.
-- `cmd` — one of `read_puit`, `sampling`, `status`.
+- `cmd` — one of `read_puit`, `status`.
+
+**One measurement command, parametrised.** Up to 2.2.0 there were two: `read_puit` and
+`sampling`, running the identical `parseParams` → `measure()` → gate path and differing only in
+that `sampling` also printed the per-ping arrays. They were merged in 2.3.0 — the arrays are now
+on every reply — because that split was what kept the raw pings out of the Pi's measurement
+path: it could only ever see one median per burst, and so medianed medians. Everything a burst
+can be asked to do differently is a parameter below; there is no second command and no mode
+flag. A diagnostic burst differs from a recorded one only in what the caller asks for and what
+it does with the reply.
 
 #### Measurement parameters
 
-Optional on `read_puit` and `sampling`; ignored by `status`. Absent — or explicitly `null` — means
+Optional on `read_puit`; ignored by `status`. Absent — or explicitly `null` — means
 "use the default".
 
 | Field        | Type  | Default          | Accepted range | Notes |
@@ -303,7 +312,7 @@ matters.
 Diagnostic recipe when a `sensor_fault` looks suspicious:
 
 ```json
-{"id":1,"cmd":"sampling","n":5,"ack_timeout_us":60000}
+{"id":1,"cmd":"read_puit","n":5,"ack_timeout_us":60000}
 ```
 
 | Result | Reading |
@@ -320,33 +329,34 @@ you to opposite ends of the wiring.
 All responses carry `"type":"resp"`, `"proto":2`, the echoed `id`, and a `status` of `"ok"` or
 `"error"`.
 
-`read_puit` — median distance in cm over the valid pings:
+`read_puit` — the median distance in cm over the valid pings, the statistics behind it, the
+effective parameters, and the per-ping detail:
 
 ```json
 {"id":42,"type":"resp","proto":2,"status":"ok","value":123.4,"unit":"cm","pulse_us":7186,
  "min":122.8,"max":124.1,"spread":1.3,
  "n":10,"n_valid":9,"n_timeout":1,"n_rejected":0,"n_no_response":0,"n_stuck":0,"ack_max_us":12289,
- "temp_c":20,"min_cm":5,"max_cm":500,"timeout_us":45000,"ack_timeout_us":50000,"min_valid":5}
-```
-
-`sampling` — the same, plus per-ping detail for diagnostics:
-
-```json
-{"id":43,"type":"resp","proto":2,"status":"ok","value":123.4,"unit":"cm",
- "min":122.8,"max":124.1,"spread":1.3,
- "n":10,"n_valid":9,"n_timeout":1,"n_rejected":0,"n_no_response":0,"n_stuck":0,"ack_max_us":12289,
  "temp_c":20,"min_cm":5,"max_cm":500,"timeout_us":45000,"ack_timeout_us":50000,"min_valid":5,
- "samples":[123.4,null,124.0,…],"pulse_us":[7186,null,7221,…],
+ "samples":[123.4,null,124.0,…],"pulses_us":[7186,null,7221,…],
  "ack_us":[12286,12289,12285,…],"ping_status":"VTVVVVVVVV"}
 ```
 
-In `samples` and `pulse_us`, `null` marks a ping that produced no pulse width at all — either no
+> **`pulse_us` and `pulses_us` are different fields and must stay so.** The scalar is the median
+> echo width, the raw counterpart of `value`; the array is one entry per ping. The Pi stores the
+> scalar in InfluxDB as a float, and InfluxDB refuses a field whose type ever changes — so a
+> single key serving both would be unrecoverable in the history rather than merely confusing.
+> Before 2.3.0 the two commands did exactly that: `read_puit` sent `pulse_us` as a scalar and
+> `sampling` sent it as an array. Merging them is what forced the plural name.
+
+In `samples` and `pulses_us`, `null` marks a ping that produced no pulse width at all — either no
 echo or no response. A ping that echoed but fell outside the window keeps its cm and µs values: raw
-truth is never discarded, only excluded from the statistics.
+truth is never discarded, only excluded from the statistics — **so anything aggregating `samples`
+must filter on `ping_status`**, or the bracket and blind-zone echoes that `min_cm`/`max_cm` exist
+to reject walk straight back into the number.
 
 `ack_us` is index-aligned with them but follows a **different** rule: it holds the trigger→rise
 latency for every ping the sensor *engaged with*, which includes the `T`imeout pings that produce no
-width. So a `null` in `pulse_us` paired with a number in `ack_us` reads as "the module answered,
+width. So a `null` in `pulses_us` paired with a number in `ack_us` reads as "the module answered,
 found nothing" — the clearest single indication that a sensor returning no data is nonetheless
 alive. `ack_us` is `null` only for `N` and `S`.
 
@@ -362,7 +372,7 @@ and `count('S') == n_stuck`. The character split is a refinement of the count, n
 these constants:
 
 ```json
-{"id":44,"type":"resp","proto":2,"status":"ok","fw":"2.2.0","role":"puit","uptime_ms":12345,
+{"id":44,"type":"resp","proto":2,"status":"ok","fw":"2.3.0","role":"puit","uptime_ms":12345,
  "max_n":25,"n_default":10,"timeout_default_us":45000,"ack_timeout_default_us":50000,
  "min_cm_default":5,"max_cm_default":500,"line_max":192}
 ```
@@ -419,10 +429,11 @@ Before treating a *fully* failed burst as a dead sensor, though, check `ack_max_
 echoed `ack_timeout_us`: see
 [When `sensor_fault` might not be the sensor](#when-sensor_fault-might-not-be-the-sensor).
 
-**Level 3 — `ping_status`: which ping, in what pattern.** One character per ping, `sampling` only:
+**Level 3 — `ping_status`: which ping, in what pattern.** One character per ping, on every
+successful reply since 2.3.0:
 
-| Char | Outcome | `samples[i]` / `pulse_us[i]` | `ack_us[i]` |
-|------|---------|------------------------------|-------------|
+| Char | Outcome | `samples[i]` / `pulses_us[i]` | `ack_us[i]` |
+|------|---------|-------------------------------|-------------|
 | `V` | valid | the values | latency |
 | `R` | rejected — echoed, outside the window | the values (kept deliberately) | latency |
 | `T` | timeout — answered, no echo | `null` | latency |
@@ -430,7 +441,7 @@ echoed `ack_timeout_us`: see
 | `S` | stuck — echo never idle, **trigger never fired** | `null` | `null` |
 
 `V` vs `R` can also be derived by comparing `samples[i]` against the echoed `min_cm`/`max_cm`. **`T`
-vs `N` cannot** from `samples`/`pulse_us` alone — both are `null` there — though `ack_us` now
+vs `N` cannot** from `samples`/`pulses_us` alone — both are `null` there — though `ack_us` now
 separates them too, since a `T` ping did engage the sensor and an `N` ping did not. `ping_status`
 remains the direct answer, and the only place `S` is visible per ping.
 
@@ -498,12 +509,14 @@ log.error("puit: protocol bug -- %s %s", code, resp.get("field", ""))
 raise Permanent(code)
 ```
 
-Note `resp.get(...)` throughout: `value`, `min`, `max`, `spread` and `pulse_us` are **absent** on
-every error reply, and `ping_status` exists only on a successful `sampling`. The counts and the
-effective parameters are the only measurement fields guaranteed on both.
+Note `resp.get(...)` throughout: `value`, `min`, `max`, `spread`, `pulse_us`, the per-ping arrays
+and `ping_status` are all **absent** on an error reply. The counts and the effective parameters are
+the only measurement fields guaranteed on both.
 
-When something needs investigating, re-issue the same burst as `sampling` — identical parameters,
-plus the per-ping arrays and `ping_status`.
+Nothing has to be re-issued to investigate a burst that succeeded: since 2.3.0 the per-ping arrays
+and `ping_status` are already on the reply you have. A burst that *failed* carries only the counts,
+so there the diagnostic is to repeat it with different parameters — a wider `ack_timeout_us`, say —
+not with a different command.
 
 - **Units / conversion:** this firmware reports **raw distance in cm only**. The
   distance→volume conversion (`volume_m3 = (220 - cm) * 0.04`) lives entirely on the Pi side
@@ -527,8 +540,13 @@ a time series: with only cm in InfluxDB, a formula fix cannot be applied to hist
 and the assumed `temp_c` alongside it, any future correction can be replayed retroactively over
 everything already recorded, for the cost of two extra fields per point.
 
-For `read_puit`, `pulse_us` is the median pulse of the valid pings — the exact raw counterpart of
-`value`, since `cm = pulse / divisor` is monotonic.
+`pulse_us` is the median pulse of the valid pings — the exact raw counterpart of `value`, since
+`cm = pulse / divisor` is monotonic and both medians are taken over the same set of pings.
+
+The Pi extends the same reasoning across bursts. It pools every `V` ping of the three bursts behind
+a reading and takes one median over all thirty, and it medians `pulses_us` over that same pool — so
+the stored cm and µs still describe one measurement and stay replayable together. Per-burst
+`pulse_us` remains the right answer for a single burst; it is simply not what gets recorded.
 
 ### Future: environment sensing
 
@@ -731,30 +749,39 @@ at the time of writing) if you want an image comparable to the PlatformIO build.
 
 Open the serial monitor at 9600 baud and reset the board.
 
-1. **Banner** → `{"type":"ready","proto":2,"fw":"2.2.0","role":"puit"}`.
+1. **Banner** → `{"type":"ready","proto":2,"fw":"2.3.0","role":"puit"}`.
 2. `{"id":1,"cmd":"status"}` → `ok` with `fw`/`role`/`uptime_ms` and the limits
    (`max_n:25`, `n_default:10`, `ack_timeout_default_us:50000`, `line_max:192`).
 3. `{"id":2,"cmd":"read_puit"}` → `ok` with a numeric `value` in cm, the four counts summing to `n`,
    and `min`/`max`/`spread`. **Check `value ≈ pulse_us / 58.24` by hand** — that is the regression
    guard for the divisor. Against a tape-measured target the reading should be **unchanged from
    fw 1.1.0**; if it moved, the rewrite shifted the calibration.
-4. **Parameters:** `{"id":3,"cmd":"sampling","n":25,"temp_c":8.5}` → 25-entry `samples` *and*
-   `pulse_us`, `null`s aligned, echoing `n:25`/`temp_c:8.5`. Against a fixed target the cm values
-   read *shorter* than at `temp_c:20` (colder air, slower sound) while `pulse_us` is **unchanged** —
-   that is what makes retroactive recomputation from `pulse_us` valid.
-   - `{"id":4,"cmd":"read_puit","n":999}` → clamped, echoes `n:25`.
-   - `{"id":5,"cmd":"read_puit","n":"ten"}` → `bad_param`, `"field":"n"`.
-   - `{"id":6,"cmd":"read_puit","min_cm":100,"max_cm":50}` → `bad_param`, `"field":"min_cm"`.
-   - `{"id":7,"cmd":"read_puit","max_cm":900}` → echoes `max_cm` capped near 772 (timeout-limited).
-5. **Plausibility window — the important one.** Hold a target ~3 cm from the sensor, inside the
+   - **Detail on the ordinary reply (2.3.0):** the same response must also carry `samples`,
+     `pulses_us`, `ack_us` and `ping_status`, each `n` long and index-aligned. `pulse_us` must
+     still be a **scalar** beside the `pulses_us` **array** — a scalar/array mix-up here is the
+     one mistake this merge could make that InfluxDB would refuse to forget.
+   - **The Pi's median, checked by hand:** take the `samples` entries whose `ping_status`
+     character is `V`, median them, and compare with `value`. They must agree — both interpolate
+     the two middle values on an even count. That equality is what says the Pi's pooling filter
+     means the same thing by "valid" as the firmware does.
+4. **Removed command:** `{"id":3,"cmd":"sampling"}` → `unknown_cmd` with `"id":3`.
+5. **Parameters:** `{"id":4,"cmd":"read_puit","n":25,"temp_c":8.5}` → 25-entry `samples` *and*
+   `pulses_us`, `null`s aligned, echoing `n:25`/`temp_c:8.5`. Against a fixed target the cm values
+   read *shorter* than at `temp_c:20` (colder air, slower sound) while `pulses_us` is **unchanged**
+   — that is what makes retroactive recomputation from the pulse valid.
+   - `{"id":5,"cmd":"read_puit","n":999}` → clamped, echoes `n:25`.
+   - `{"id":6,"cmd":"read_puit","n":"ten"}` → `bad_param`, `"field":"n"`.
+   - `{"id":7,"cmd":"read_puit","min_cm":100,"max_cm":50}` → `bad_param`, `"field":"min_cm"`.
+   - `{"id":8,"cmd":"read_puit","max_cm":900}` → echoes `max_cm` capped near 772 (timeout-limited).
+6. **Plausibility window — the important one.** Hold a target ~3 cm from the sensor, inside the
    blind zone: expect `out_of_range` with `n_rejected ≈ n` and `n_timeout: 0`. *On fw 1.1.0 the same
    shot returns `status:"ok"` with a ~3 cm value* — worth reproducing on the old firmware first,
-   since it is the whole reason this changed. Then `{"id":8,"cmd":"read_puit","min_cm":1}` on the
+   since it is the whole reason this changed. Then `{"id":9,"cmd":"read_puit","min_cm":1}` on the
    same shot → `ok`, confirming it was the window that rejected it.
-6. **Gate:** aim so only a few pings return (oblique or partly obstructed surface) →
+7. **Gate:** aim so only a few pings return (oblique or partly obstructed surface) →
    `insufficient_samples` with `0 < n_valid < min_valid`. Resend with `"min_valid":0` → the same shot
    returns `ok`.
-7. **Sensor fault detection** — the two failures `proto 1` could not separate:
+8. **Sensor fault detection** — the two failures `proto 1` could not separate:
    - **Unplug the echo wire (D7)** → `sensor_fault` with `n_no_response: n`. Check it is *not*
      `echo_timeout`; the whole point is that a disconnected sensor no longer looks like a sensor
      seeing nothing.
@@ -764,15 +791,17 @@ Open the serial monitor at 9600 baud and reset the board.
      Expect `out_of_range` with `n_rejected: n` and `n_no_response: 0`, and `pulse_us` around
      `38000` (≈652 cm, beyond `max_cm`). If instead you get `n_timeout: n`, your module does not emit
      the 38 ms pulse — harmless, the rise detection still catches genuine faults, but note it.
-   - Run `sampling` in each case and read `ping_status`: `NNNNNNNNNN` for a fault, `RRRRRRRRRR` for
-     blind-but-alive.
+   - Read `ping_status` off each of those replies — no separate command needed since 2.3.0:
+     `NNNNNNNNNN` for a fault, `RRRRRRRRRR` for blind-but-alive. Note that `sensor_fault` and
+     `out_of_range` are *error* replies, which carry the counts but **not** `ping_status`; get the
+     pattern by relaxing the burst until it succeeds (`"min_valid":0`) and reading it there.
    - **Tie echo (D7) high** (to 3V3 through a resistor) → `sensor_fault` with `ping_status` all `S`
      and `n_stuck: n`, *not* `N`. The trigger is never fired in this path, so this is the one fault
      that a scope on D8 shows as silence rather than as pulses going nowhere.
-8. **Re-check `ack_timeout_us` — required whenever the sensor module is replaced.** The default is
+9. **Re-check `ack_timeout_us` — required whenever the sensor module is replaced.** The default is
    calibrated to the module currently fitted (~12.3 ms); a replacement clone may differ by an order
    of magnitude in either direction, and getting this wrong reports healthy hardware as dead.
-   - `{"id":10,"cmd":"sampling","n":25}` → read `ack_max_us` and the `ack_us` array. Expect a tight
+   - `{"id":10,"cmd":"read_puit","n":25}` → read `ack_max_us` and the `ack_us` array. Expect a tight
      spread; a *scattered* one points at the `delay(3)` ping spacing rather than the module.
    - If `ack_max_us` has moved, set `DEFAULT_ACK_TIMEOUT_US` to ~4× the new maximum, and record the
      measurement in the commit message the way the current one is recorded in the sketch. Keep it
@@ -781,12 +810,18 @@ Open the serial monitor at 9600 baud and reset the board.
      on a *working* sensor must produce `sensor_fault` with `n_no_response: n`. **This is the
      firmware calling healthy hardware dead**, reproduced deliberately — the exact bug that shipped
      at 2 ms. Re-run without the override to confirm it recovers.
-9. **Errors:** send `hello` → `bad_request` with `"id":null`. Send `{"cmd":"status"}` → `bad_id`.
-   Send `{"id":12,"cmd":"nope"}` → `unknown_cmd` with `"id":12`. Paste a line longer than 192
-   characters → `line_too_long`, then confirm the **next** valid request still answers — that proves
-   the reader recovers by draining to the newline.
-10. **Reader:** send two requests back-to-back with no delay → two correlated responses, no lost
+10. **Errors:** send `hello` → `bad_request` with `"id":null`. Send `{"cmd":"status"}` → `bad_id`.
+    Send `{"id":12,"cmd":"nope"}` → `unknown_cmd` with `"id":12`. Paste a line longer than 192
+    characters → `line_too_long`, then confirm the **next** valid request still answers — that proves
+    the reader recovers by draining to the newline.
+11. **Reader:** send two requests back-to-back with no delay → two correlated responses, no lost
     line. Send an empty line → no reply at all. A `read_puit` should return promptly, with no 200 ms
     idle penalty and no 1 s timeout stall.
-11. Back on the Pi, once `read_puit.py` is updated for `proto 2`, run `/mesure` (Telegram) or wait
-    for `sensors.service` — it should record a value, confirming end-to-end compatibility.
+12. Back on the Pi, run `/mesure` (Telegram) or wait for `sensors.service` — it should record a
+    value, confirming end-to-end compatibility. On 2.3.0 also check the log line: it reports the
+    reading as the median of *n* valid pings over the bursts, and must **not** carry the
+    "No per-ping detail … falling back" warning. That warning after a successful flash means the
+    board is still running the old image.
+13. **`/echantillons`** from an admin chat → the per-ping block still renders its `cm :`, `µs :` and
+    `ack µs :` rows. That is the end-to-end proof of the `pulses_us` rename, since the bot reads
+    that key and the firmware writes it.

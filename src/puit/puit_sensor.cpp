@@ -34,7 +34,13 @@
 #define LEDPIN LED_BUILTIN
 
 // --- Protocol / firmware identity -------------------------------------------
-#define FW_VERSION "2.2.0"
+#define FW_VERSION "2.3.0"
+// Still 2 after the 2.3.0 command merge, deliberately: `sampling` folded into
+// `read_puit`, which only GAINED fields. A board on 2.2.0 therefore keeps
+// answering the Pi's `read_puit` correctly while a flash is pending, and the Pi
+// falls back to its old aggregation for those few seconds -- see the comment on
+// BURSTS in sensors/read_puit.py. Bumping this would have made the reflash a
+// flag day instead.
 #define PROTO_VERSION 2
 
 // Board role, injected per environment by platformio.ini (-DPIJARDIN_ROLE). It rides on
@@ -169,7 +175,6 @@ static bool lineOverflow = false;
 bool hasContent();
 void handleLine(const char *line);
 void handleReadPuit(JsonVariantConst id, JsonVariantConst req);
-void handleSampling(JsonVariantConst id, JsonVariantConst req);
 void handleStatus(JsonVariantConst id);
 bool optInt(JsonVariantConst req, const char *key, int *out, const char **bad_field);
 bool optULong(JsonVariantConst req, const char *key, unsigned long *out, const char **bad_field);
@@ -178,6 +183,7 @@ bool parseParams(JsonVariantConst req, MeasureParams *p, const char **bad_field)
 void beginResponse(JsonDocument &doc, JsonVariantConst id);
 void addStats(JsonDocument &doc, const Measurement *m);
 void addContext(JsonDocument &doc, const Measurement *m, const MeasureParams *p);
+void addDetail(JsonDocument &doc, const Measurement *m);
 bool gateMeasurement(JsonVariantConst id, const Measurement *m, const MeasureParams *p);
 void sendError(const JsonVariantConst *id, const char *code, const char *field);
 void sendResponse(const JsonDocument &doc);
@@ -276,8 +282,6 @@ void handleLine(const char *line) {
   const char *cmd = req["cmd"] | "";
   if (strcmp(cmd, "read_puit") == 0) {
     handleReadPuit(id, req.as<JsonVariantConst>());
-  } else if (strcmp(cmd, "sampling") == 0) {
-    handleSampling(id, req.as<JsonVariantConst>());
   } else if (strcmp(cmd, "status") == 0) {
     handleStatus(id);
   } else {
@@ -289,6 +293,15 @@ void handleLine(const char *line) {
 
 // --- Command handlers --------------------------------------------------------
 
+// The one measurement command. Everything it can be asked to do differently is a
+// request parameter (n, timeout_us, ack_timeout_us, temp_c, min_cm, max_cm,
+// min_valid) -- there is no second command and no mode flag.
+//
+// It used to have a twin, `sampling`, identical but for printing the per-ping
+// arrays. That split was what kept the raw pings out of the measurement path: the
+// Pi could only ever see three burst medians, and so medianed medians. The arrays
+// are now on every reply (addDetail below), which is what lets the Pi pool all the
+// pings of all the bursts and take one median over the lot.
 void handleReadPuit(JsonVariantConst id, JsonVariantConst req) {
   MeasureParams p;
   const char *bad_field = nullptr;
@@ -311,78 +324,7 @@ void handleReadPuit(JsonVariantConst id, JsonVariantConst req) {
   doc["pulse_us"] = m.median_pulse;  // raw counterpart of value; see README
   addStats(doc, &m);
   addContext(doc, &m, &p);
-  sendResponse(doc);
-}
-
-void handleSampling(JsonVariantConst id, JsonVariantConst req) {
-  MeasureParams p;
-  const char *bad_field = nullptr;
-  if (!parseParams(req, &p, &bad_field)) {
-    sendError(&id, "bad_param", bad_field);
-    return;
-  }
-
-  Measurement m;
-  measure(&m, &p);
-  if (!gateMeasurement(id, &m, &p)) {
-    return;
-  }
-
-  JsonDocument doc;
-  beginResponse(doc, id);
-  doc["status"] = "ok";
-  doc["value"] = m.median;
-  doc["unit"] = "cm";
-  addStats(doc, &m);
-  addContext(doc, &m, &p);
-
-  // Per-ping detail for diagnostics. null marks a ping that produced no width
-  // at all (no echo, or no response) -- a ping that echoed but fell outside the
-  // window keeps its numbers, because raw truth is never discarded, only
-  // excluded from the statistics.
-  JsonArray samples = doc["samples"].to<JsonArray>();
-  JsonArray pulses = doc["pulse_us"].to<JsonArray>();
-  for (int i = 0; i < m.n; i++) {
-    if (m.status[i] == PING_OK || m.status[i] == PING_REJECTED) {
-      samples.add(m.samples[i]);
-      pulses.add(m.pulses[i]);
-    } else {
-      samples.add(nullptr);
-      pulses.add(nullptr);
-    }
-  }
-
-  // Latency from trigger to Echo rising, index-aligned with the arrays above.
-  // Populated for every ping the sensor answered -- including T)imeouts, which
-  // produce no width but did engage, and are therefore the cheapest evidence
-  // that the module is alive and how quickly it reacts.
-  JsonArray acks = doc["ack_us"].to<JsonArray>();
-  for (int i = 0; i < m.n; i++) {
-    if (m.status[i] == PING_NO_RESPONSE || m.status[i] == PING_STUCK) {
-      acks.add(nullptr);
-    } else {
-      acks.add(m.ack_us[i]);
-    }
-  }
-
-  // One character per ping, in order: V)alid, R)ejected, T)imeout, N)o response,
-  // S)tuck. The null cases above are indistinguishable in the arrays, and reading
-  // the pattern beats re-deriving it from min_cm/max_cm -- a glance shows
-  // whether losses are scattered (noise) or clustered (intermittent contact).
-  // N and S are both counted by n_no_response: count('N') + count('S') == it.
-  char pattern[MAX_N + 1];
-  for (int i = 0; i < m.n; i++) {
-    switch (m.status[i]) {
-      case PING_OK:       pattern[i] = 'V'; break;
-      case PING_REJECTED: pattern[i] = 'R'; break;
-      case PING_TIMEOUT:  pattern[i] = 'T'; break;
-      case PING_STUCK:    pattern[i] = 'S'; break;
-      default:            pattern[i] = 'N'; break;
-    }
-  }
-  pattern[m.n] = '\0';
-  doc["ping_status"] = pattern;  // copied into the document, not referenced
-
+  addDetail(doc, &m);
   sendResponse(doc);
 }
 
@@ -519,6 +461,66 @@ void addContext(JsonDocument &doc, const Measurement *m, const MeasureParams *p)
   doc["timeout_us"] = p->timeout_us;
   doc["ack_timeout_us"] = p->ack_timeout_us;
   doc["min_valid"] = p->min_valid;
+}
+
+// The per-ping detail behind the statistics above: what every individual ping of
+// the burst did. On every measurement reply since 2.3.0, not just a diagnostic
+// one -- the Pi medians over these across all its bursts, so they are the
+// measurement rather than a commentary on it.
+void addDetail(JsonDocument &doc, const Measurement *m) {
+  // null marks a ping that produced no width at all (no echo, or no response) --
+  // a ping that echoed but fell outside the window keeps its numbers, because raw
+  // truth is never discarded, only excluded from the statistics. Which means a
+  // consumer averaging these MUST filter on ping_status; samples[] alone would
+  // readmit exactly the bracket echoes min_cm/max_cm exist to throw out.
+  //
+  // "pulses_us" is plural because "pulse_us" is taken: that one is the scalar
+  // median above, the raw counterpart of `value`, and the Pi stores it in
+  // InfluxDB as a float. The two must never share a key -- InfluxDB refuses a
+  // field whose type changes, so a scalar/array collision here would be
+  // unrecoverable in the history rather than merely wrong.
+  JsonArray samples = doc["samples"].to<JsonArray>();
+  JsonArray pulses = doc["pulses_us"].to<JsonArray>();
+  for (int i = 0; i < m->n; i++) {
+    if (m->status[i] == PING_OK || m->status[i] == PING_REJECTED) {
+      samples.add(m->samples[i]);
+      pulses.add(m->pulses[i]);
+    } else {
+      samples.add(nullptr);
+      pulses.add(nullptr);
+    }
+  }
+
+  // Latency from trigger to Echo rising, index-aligned with the arrays above.
+  // Populated for every ping the sensor answered -- including T)imeouts, which
+  // produce no width but did engage, and are therefore the cheapest evidence
+  // that the module is alive and how quickly it reacts.
+  JsonArray acks = doc["ack_us"].to<JsonArray>();
+  for (int i = 0; i < m->n; i++) {
+    if (m->status[i] == PING_NO_RESPONSE || m->status[i] == PING_STUCK) {
+      acks.add(nullptr);
+    } else {
+      acks.add(m->ack_us[i]);
+    }
+  }
+
+  // One character per ping, in order: V)alid, R)ejected, T)imeout, N)o response,
+  // S)tuck. The null cases above are indistinguishable in the arrays, and reading
+  // the pattern beats re-deriving it from min_cm/max_cm -- a glance shows
+  // whether losses are scattered (noise) or clustered (intermittent contact).
+  // N and S are both counted by n_no_response: count('N') + count('S') == it.
+  char pattern[MAX_N + 1];
+  for (int i = 0; i < m->n; i++) {
+    switch (m->status[i]) {
+      case PING_OK:       pattern[i] = 'V'; break;
+      case PING_REJECTED: pattern[i] = 'R'; break;
+      case PING_TIMEOUT:  pattern[i] = 'T'; break;
+      case PING_STUCK:    pattern[i] = 'S'; break;
+      default:            pattern[i] = 'N'; break;
+    }
+  }
+  pattern[m->n] = '\0';
+  doc["ping_status"] = pattern;  // copied into the document, not referenced
 }
 
 // Decide whether the burst is good enough to report a distance. When it is not,
