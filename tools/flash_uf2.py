@@ -108,7 +108,10 @@ def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
     uf2 = sys.argv[1]
-    port = sys.argv[2] if len(sys.argv) > 2 else None
+    # An empty argv[2] counts as "not given": PlatformIO substitutes $UPLOAD_PORT
+    # with an empty string when no --upload-port was passed, and treating that as
+    # a port name would skip the auto-detection below and then fail to open "".
+    port = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else None
 
     if not os.path.isfile(uf2):
         sys.exit(f"no such image: {uf2}  (run `pio run -e pump` first)")

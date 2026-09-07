@@ -18,24 +18,31 @@ They share the serial framing, but **not the chip** — see the warning below th
 | --- | --- | --- | --- | --- | --- |
 | Well level | `puit` | XIAO **SAMD21** | [src/puit/puit_sensor.cpp](src/puit/puit_sensor.cpp) | this file, below | Distance down to the water surface, HC-SR04 ultrasonic |
 | Pump state | `pump` | XIAO **RP2040** | [src/pump/pump_sensor.cpp](src/pump/pump_sensor.cpp) | [docs/pump.md](docs/pump.md) | **When** the pump starts and stops, ZMPT101B AC voltage sense |
+| SHT31 bench rig | `sht31` | XIAO **RP2040** | [src/sht31/sht31_sensor.cpp](src/sht31/sht31_sensor.cpp) | [docs/sht31.md](docs/sht31.md) | ⚠️ **Not deployed** — qualifies an SHT31 temp/humidity probe on the desk before it is fitted at the well |
 
-> ⚠️ **The two boards are different microcontrollers in an identical package.** A XIAO SAMD21 and a
-> XIAO RP2040 are the same size, the same pin count and the same colour; only the silkscreen tells
-> them apart. They need different platforms, cores and bootloaders, and **an image built for one
-> will not run on the other**. Check the board before `-t upload`.
+> ⚠️ **The deployed boards are different microcontrollers in an identical package.** A XIAO SAMD21
+> and a XIAO RP2040 are the same size, the same pin count and the same colour; only the silkscreen
+> tells them apart. They need different platforms, cores and bootloaders, and **an image built for
+> one will not run on the other**. Check the board before `-t upload`.
+>
+> The `sht31` rig is a **third RP2040**, which means it and the pump board are now interchangeable
+> at a glance *and* at the toolchain level: a wrong `-e` there flashes successfully and silently
+> replaces a working pump detector with a bench rig. `pio device list` and the boot banner's `role`
+> are the checks — see [docs/sht31.md](docs/sht31.md#build--flash).
 
-Both speak the **same NDJSON envelope** (`id` / `type` / `proto` / `status` / `code`) over USB
+All three speak the **same NDJSON envelope** (`id` / `type` / `proto` / `status` / `code`) over USB
 serial, documented once in [Serial protocol contract](#serial-protocol-contract) below. They do
 **not** share a command set, and `proto` is numbered **per firmware** — each board's contract starts
-at 1 and is versioned independently, so the two are both at `proto 2` by coincidence and mean
-entirely different things by it. Always read `role` from the boot banner — **both** firmwares send
-it — rather than inferring the board from a `proto` number. `role` is not a literal in either
-sketch: it comes from `-DPIJARDIN_ROLE` in that environment's `build_flags`, so it cannot drift from
-the environment that built the firmware.
+at 1 and is versioned independently, so `puit` and `pump` both being at `proto 2` is a coincidence
+and they mean entirely different things by it (`sht31` is at 1). Always read `role` from the boot
+banner — **every** firmware sends it — rather than inferring the board from a `proto` number. `role`
+is not a literal in any sketch: it comes from `-DPIJARDIN_ROLE` in that environment's `build_flags`,
+so it cannot drift from the environment that built the firmware.
 
 > **Everything from [Serial protocol contract](#serial-protocol-contract) to the end of this file
 > describes the well sensor.** The pump board's contract, wiring and — importantly — its required
-> **calibration** live in [docs/pump.md](docs/pump.md).
+> **calibration** live in [docs/pump.md](docs/pump.md); the SHT31 bench rig's live in
+> [docs/sht31.md](docs/sht31.md).
 
 ### Where the pump board departs from the shared contract
 
@@ -53,9 +60,11 @@ handle, both introduced by pump `proto 2`:
   threshold is settable over the wire — the rationale, and why the earlier stateless design was
   right for what it was, is in [docs/pump.md](docs/pump.md#the-principle-that-reversed).
 
-The well sensor (`puit`) remains pure request/response and fully stateless.
+The well sensor (`puit`) remains pure request/response and fully stateless. The `sht31` bench rig
+also pushes events — while streaming, and when its heater switches itself off — so the same
+"match on `type` *and* `id`" rule applies to it ([docs/sht31.md](docs/sht31.md#serial-protocol)).
 
-### Adding a third board
+### Adding another board
 
 1. `src/<name>/<name>_sensor.cpp`
 2. `[env:<name>]` in [platformio.ini](platformio.ini) with `build_src_filter = -<*> +<<name>/>`
@@ -71,26 +80,30 @@ the `.ino` step ever added.
 
 ## Hardware
 
-Both boards are in the **Seeed Studio XIAO** form factor with native USB, but they are different
-chips: the well sensor is a **XIAO SAMD21** (Atmel, Cortex-M0+) and the pump sensor is a **XIAO
-RP2040** (Raspberry Pi, dual Cortex-M0+).
+Every board is in the **Seeed Studio XIAO** form factor with native USB, but they are not all the
+same chip: the well sensor is a **XIAO SAMD21** (Atmel, Cortex-M0+), while the pump sensor and the
+SHT31 bench rig are **XIAO RP2040s** (Raspberry Pi, dual Cortex-M0+).
 
 Their status LEDs no longer mean the same thing. On the **well sensor** it lights while a command is
 being processed. On the **pump sensor** it shows the detector's state **in colour** — solid green
 for on, a green blip every 3 s for off, blue while undecided, red for a sensor fault
 ([docs/pump.md](docs/pump.md#status-led)) — because that board measures continuously, so a busy
-indicator would simply be lit all the time.
+indicator would simply be lit all the time. On the **bench rig** it shows whether the probe is
+answering at all ([docs/sht31.md](docs/sht31.md#status-led)), which is the one question a bench rig
+has to answer before its serial monitor is even open.
 
 > ⚠️ **The XIAO RP2040 has four user-visible LEDs** (the three dice of the user LED on GPIO17/16/25,
 > plus a NeoPixel on GPIO12/11), and **leaving the unused ones uninitialised does not leave them
 > off** — an uninitialised pin is an input, and these LEDs are wired to 3V3, so a floating cathode
-> glows. The pump firmware drives every one of them explicitly at boot for that reason. Note also
-> that the RP2040's user LEDs are **active low**.
+> glows. The pump and `sht31` firmwares drive every one of them explicitly at boot for that reason.
+> Note also that the RP2040's user LEDs are **active low**.
 
-> ⚠️ **Both are 3.3 V parts and neither is 5 V tolerant.** The SAMD21's ADC reference is
+> ⚠️ **Both chips are 3.3 V parts and neither is 5 V tolerant.** The SAMD21's ADC reference is
 > `VDDANA` = 3.3 V; the RP2040's is 3.3 V likewise. Any sensor module with an analog output must be
 > powered from the **3V3** pad, not 5V — see [docs/pump.md](docs/pump.md), where getting this wrong
-> destroys the analog input.
+> destroys the analog input. Digital modules are not exempt: an I²C breakout powered from 5V pulls
+> SDA/SCL up to **its** rail and drives 5 V into the MCU, which is why
+> [docs/sht31.md](docs/sht31.md#wiring) insists on 3V3 for a sensor whose own die would tolerate 5 V.
 
 **Well sensor (`puit`)** — HC-SR04-style ultrasonic distance sensor, mounted above the well,
 measuring the distance down to the water surface.
@@ -103,6 +116,17 @@ measuring the distance down to the water surface.
 
 **Pump sensor (`pump`)** — ZMPT101B AC voltage module across the pump's switched feed. Wiring,
 including the mistake that silently makes it useless, is in [docs/pump.md](docs/pump.md).
+
+**SHT31 bench rig (`sht31`)** — Sensirion SHT31 temperature/humidity probe on I²C (`D4` = SDA,
+`D5` = SCL, address `0x44`), on a spare XIAO RP2040. The firmware's commands and diagnostics are in
+[docs/sht31.md](docs/sht31.md); **wiring the probe to any board** — conductor map, per-board pin
+tables, measured electrical characteristics — is in
+[docs/sht31-hookup.md](docs/sht31-hookup.md). Its destination is the well head, see
+[Future: environment sensing](#future-environment-sensing) below.
+
+> ⚠️ On this probe **yellow is SDA and green is SCL**, the opposite of the usual convention. The
+> colours are not a specification; [docs/sht31-hookup.md](docs/sht31-hookup.md#conductor-map) has
+> what was actually measured.
 
 ## Serial protocol contract
 
@@ -550,8 +574,13 @@ the stored cm and µs still describe one measurement and stay replayable togethe
 
 ### Future: environment sensing
 
-Not implemented — recorded here so the intent survives. Once a temperature/humidity sensor is fitted
-at the well head (I²C on D4/D5; **not** a DHT22, whose ~2 s read would dominate a measurement burst):
+Not implemented **on this board yet** — but the probe has been chosen and is being qualified. An
+**SHT31** (I²C, ~15 ms read) is on the bench now under its own firmware,
+[docs/sht31.md](docs/sht31.md), on a spare RP2040 because the well board is not to hand; the driver
+there is written to be lifted into this sketch unchanged, and its `temp_c` field is deliberately the
+name `read_puit` already uses for the assumed air temperature. What follows is unchanged and still
+binding. Once the sensor is fitted at the well head (I²C on D4/D5; **not** a DHT22, whose ~2 s read
+would dominate a measurement burst):
 
 - The board reads it **inline, once per burst** — not on a timer. The temperature that matters is the
   one in the air column at ping time, and a cached value reintroduces the very error the sensor is
@@ -605,37 +634,45 @@ You flash this by connecting the XIAO directly to your computer over USB.
 > firmware gets written. Bare `pio run` defaults to `puit` (set by `default_envs` in
 > [platformio.ini](platformio.ini)); anything to do with the pump board must say `-e pump`.
 >
-> They are also **different chips** — SAMD21 for `puit`, RP2040 for `pump` — so a mismatched upload
-> now fails at the flashing step rather than producing a bricked-looking board. That is a safety net,
-> not a reason to stop checking the silkscreen.
+> `puit` and `pump` are also **different chips** — SAMD21 and RP2040 — so a mismatched upload
+> between *those two* fails at the flashing step rather than producing a bricked-looking board. That
+> is a safety net, not a reason to stop checking the silkscreen — and it does **not** cover `pump`
+> against `sht31`, which are the same chip: that pair uploads happily either way round and leaves
+> you with a board that boots, answers, and is the wrong firmware.
 
 1. **Install the PlatformIO IDE extension** in VSCode. Opening this folder will prompt you to
    install it (see [`.vscode/extensions.json`](.vscode/extensions.json)).
 2. **Open this folder** in VSCode. PlatformIO reads [`platformio.ini`](platformio.ini) and, on the
    first build, automatically downloads each environment's platform and toolchain — no manual
-   "board core" install like the Arduino IDE requires. The two envs pull **different** toolchains
-   (`atmelsam` for `puit`, an RP2040 one for `pump`), so expect the first `-e pump` build to take
-   several minutes and need network.
+   "board core" install like the Arduino IDE requires. The envs pull **different** toolchains
+   (`atmelsam` for `puit`, an RP2040 one for `pump` and `sht31`), so expect the first `-e pump`
+   build to take several minutes and need network. `-e sht31` reuses what `-e pump` downloaded.
 3. **Connect the board** over USB — and be sure which one it is. `pio device list` names it:
-   each firmware sets its own USB product string, so the boards show up as **PiJardin Puit**
-   and **PiJardin Pompe** rather than two identical `Seeeduino XIAO` / `XIAO RP2040` entries.
-   (Windows caches that name per VID+PID, so Device Manager may lag a firmware change until
-   you uninstall the device and replug; `pio device list` reads the live descriptor.)
+   each firmware sets its own USB product string, so the boards show up as **PiJardin Puit**,
+   **PiJardin Pump** and **PiJardin SHT31** rather than identical `Seeeduino XIAO` /
+   `XIAO RP2040` entries. (Windows caches that name per VID+PID, so Device Manager may lag a
+   firmware change until you uninstall the device and replug; `pio device list` reads the live
+   descriptor.)
 4. **Upload:**
    ```
-   pio run -e puit -t upload      # well sensor
-   pio run -e pump -t upload      # pump sensor
+   pio run -e puit  -t upload     # well sensor
+   pio run -e pump  -t upload     # pump sensor
+   pio run -e sht31 -t upload     # SHT31 bench rig
    ```
    In the VSCode status bar, the environment selector sits next to the **→ (Upload)** button —
    set it first, then upload. To build without uploading, drop `-t upload`:
    ```
-   pio run -e puit -e pump        # build both, e.g. to check nothing broke
+   pio run -e puit -e pump -e sht31    # build all, e.g. to check nothing broke
    ```
+   With **two RP2040 boards plugged in at once**, name the port —
+   `--upload-port COM7` — or [`tools/flash_uf2.py`](tools/flash_uf2.py) refuses to guess which one
+   to reboot into its bootloader. See [docs/sht31.md](docs/sht31.md#build--flash).
 5. **Serial monitor** (to test): click the plug icon, or run `pio device monitor -b 9600`.
-   The boot banner confirms which firmware is actually on the board: `"role":"puit"` or
-   `"role":"pump"`. The USB product string in step 3 says what the board *claims* to be; the
-   banner's `role` is what the firmware on it actually is. They agree unless you crossed a
-   flash — which is exactly the mistake worth catching here.
+   The boot banner confirms which firmware is actually on the board: `"role":"puit"`,
+   `"role":"pump"` or `"role":"sht31"`. The USB product string in step 3 says what the board
+   *claims* to be; the banner's `role` is what the firmware on it actually is. They agree unless
+   you crossed a flash — which is exactly the mistake worth catching here, and the only check that
+   catches it between the two RP2040 boards.
 
 ### Making `pio` work in a terminal
 
