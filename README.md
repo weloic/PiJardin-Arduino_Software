@@ -147,7 +147,7 @@ the Pi can correlate replies and ignore stray lines; sensor failures are reporte
   identify what it is talking to from any reply, not just the banner.
 - **Boot banner:** on reset the board prints one line and nothing else until commanded:
   ```json
-  {"type":"ready","proto":2,"fw":"2.3.0","role":"puit"}
+  {"type":"ready","proto":2,"fw":"2.4.0","role":"puit"}
   ```
   The Pi resets the board (DTR toggle) and waits for a line that parses to JSON with
   `type == "ready"` before issuing commands. `role` says which board answered — check it
@@ -185,6 +185,7 @@ Optional on `read_puit`; ignored by `status`. Absent — or explicitly `null` �
 | `n`          | int   | `10`             | 1 – 25         | pings per burst |
 | `timeout_us` | int   | `45000`          | 2000 – 60000   | per-ping echo timeout; also caps reachable distance (~772 cm at the default). Deliberately above the sensor's ~38 ms "nothing found" pulse — see below |
 | `ack_timeout_us` | int | `50000`        | 500 – 60000    | how long to wait for echo to **rise** after a trigger before calling the ping a no-response. The fitted module actually takes **~12.3 ms**, so the default is ~4× measured. Sweep this when diagnosing `sensor_fault` — see below |
+| `cycle_ms`   | int   | `100`            | 20 – 1000      | minimum time **trigger to trigger**, enforced across bursts and requests. Datasheet minimum is 60 ms; 100 ms because the well is a reverberant concrete tank — see [Ping spacing](#ping-spacing). Below 60 is out of spec and exists only to reproduce the pre-2.4.0 timing in a diagnostic |
 | `temp_c`     | float | `20.0`           | −20 – 60       | assumed air temperature; drives the µs→cm divisor |
 | `min_cm`     | float | `5.0`            | 0 – 1030       | lower edge of the plausibility window |
 | `max_cm`     | float | `500.0`          | 0 – 1030       | upper edge; additionally capped to what `timeout_us` can reach |
@@ -323,13 +324,15 @@ Three things follow, and together they make the assumption falsifiable:
   without reflashing. If `n_no_response: n` at 2 ms becomes `n_valid: n` at 50 ms, the window was
   the fault and the sensor was never broken.
 - **The default is 50 ms** — ~4× the measured maximum. The only thing traded away by erring long is
-  burst duration, and that trade is **free here**: a ping that answers and then finds nothing already
-  costs `12.3 + timeout_us + 3` = 60.3 ms, so an all-timeout `n=25` burst takes **1.51 s** while an
-  all-dead one at this window takes 1.33 s. The window is not what bounds the worst case, so buying
+  burst duration, and that trade is **free here**: since 2.4.0 every ping is paced to `cycle_ms`
+  (100 ms), and both a ping that answers and then finds nothing (`12.3 + timeout_us` = 57.3 ms) and
+  one that never answers (50 ms) fit inside that cycle — an all-timeout and an all-dead `n=25` burst
+  both take **~2.5 s**, like a healthy one. The window is not what bounds the worst case, so buying
   margin with it costs nothing. Erring short costs a false hardware alert.
 
-⚠️ **Size the Pi's serial read timeout against 1.51 s, not against a good reading.** A healthy burst
-returns in ~0.5 s, but a fully blind one takes three times that. Too short a timeout turns a
+⚠️ **Size the Pi's serial read timeout against the worst case, not against a good reading.** Per
+ping that is `cycle_ms` *or* settle (40 ms) + `ack_timeout_us` + `timeout_us`, whichever is longer,
+so a bound of `n × (cycle_ms + 40 ms + ack_timeout_us + timeout_us)` is always safe. Too short a timeout turns a
 carefully diagnosed `sensor_fault` into a generic comms error at precisely the moment the diagnosis
 matters.
 
@@ -360,7 +363,8 @@ effective parameters, and the per-ping detail:
 {"id":42,"type":"resp","proto":2,"status":"ok","value":123.4,"unit":"cm","pulse_us":7186,
  "min":122.8,"max":124.1,"spread":1.3,
  "n":10,"n_valid":9,"n_timeout":1,"n_rejected":0,"n_no_response":0,"n_stuck":0,"ack_max_us":12289,
- "temp_c":20,"min_cm":5,"max_cm":500,"timeout_us":45000,"ack_timeout_us":50000,"min_valid":5,
+ "temp_c":20,"min_cm":5,"max_cm":500,"timeout_us":45000,"ack_timeout_us":50000,"cycle_ms":100,
+ "min_valid":5,
  "samples":[123.4,null,124.0,…],"pulses_us":[7186,null,7221,…],
  "ack_us":[12286,12289,12285,…],"ping_status":"VTVVVVVVVV"}
 ```
@@ -396,8 +400,9 @@ and `count('S') == n_stuck`. The character split is a refinement of the count, n
 these constants:
 
 ```json
-{"id":44,"type":"resp","proto":2,"status":"ok","fw":"2.3.0","role":"puit","uptime_ms":12345,
+{"id":44,"type":"resp","proto":2,"status":"ok","fw":"2.4.0","role":"puit","uptime_ms":12345,
  "max_n":25,"n_default":10,"timeout_default_us":45000,"ack_timeout_default_us":50000,
+ "cycle_default_ms":100,
  "min_cm_default":5,"max_cm_default":500,"line_max":192}
 ```
 
@@ -490,16 +495,42 @@ Retrying only ever helps the two transient rows. `out_of_range` and `sensor_faul
 problems: something has to be looked at or moved. Include `n_stuck` and `ack_max_us` in the alert —
 they are what turn "go look at the well" into "go look at the echo wire".
 
-> **Known limitation affecting `n_no_response`.** The firmware currently waits only `delay(3)`
-> between pings, while the HC-SR04 datasheet recommends a ≥60 ms measurement cycle. A trigger
-> arriving while the module is still busy may be ignored, producing an `N` that is a *timing*
-> artefact rather than a wiring fault. Until that gap is raised, treat an isolated `N` as worth
-> investigating rather than as proof of a hardware failure; a burst that is mostly or entirely `N`
-> is unambiguous either way.
->
-> Note this interacts with `ack_timeout_us`: a module still finishing its previous cycle is exactly
-> a module that answers *late*. If `ack_us` shows scattered high values, the ping spacing is the
-> more likely culprit than the module — raise the gap before tightening the window.
+#### Ping spacing
+
+Up to 2.3.0 the only spacing between pings was a `delay(3)` after each echo. With the fitted
+module's fixed 12.3 ms trigger→rise latency, that put a ping out every ~22 ms at a 124 cm level —
+a third of the HC-SR04 datasheet's **≥ 60 ms measurement cycle** ("to prevent trigger signal to the
+echo signal").
+
+It showed in the data. At low levels, readings regularly came back **5–25 cm short** of the
+surface, clustered tightly, and by an amount that **moved with the water level** — 113.9 cm against
+a true 123.7, 97.3 against 112, 83.7 against 104 (Aug–Oct 2026). Nothing fixed in the tank could do
+that, since an obstacle reads the same wherever the water is; it is what one ping's echo, still
+bouncing between the water and the ceiling, looks like when the *next* ping hears it first and takes
+it for its own. It also explains why the README used to warn that an isolated `N` could be a timing
+artefact: a module still finishing its previous cycle may ignore a trigger.
+
+Since **2.4.0** `ping()` waits until `cycle_ms` has elapsed since the previous trigger before firing,
+measured trigger to trigger as the datasheet states it, and the `delay(3)` is gone. The guard is
+global, so two requests arriving back to back are spaced as well. The default is **100 ms**, not the
+datasheet's 60: that figure is for open air, and the well is a closed **concrete** tank — hard walls,
+a still water surface, nearly nothing to absorb 40 kHz except the air itself (~1.3 dB/m). A rough
+Sabine estimate puts the residual tail around −30 dB at 60 ms and −50 dB at 100 ms; the tank's actual
+absorption is not measured, which is why the value is a parameter rather than a constant.
+
+Cost: a 10-ping burst now takes ~1 s instead of ~0.25 s. Its pings also span ~1 s of the surface
+instead of ~0.1 s, which helps rather than hurts the Pi's ripple handling.
+
+**How to check it worked** — on a level where the short readings used to appear (around 110–125 cm):
+
+```json
+{"id":1,"cmd":"read_puit","n":25,"cycle_ms":20}
+{"id":2,"cmd":"read_puit","n":25}
+```
+
+The first reproduces the old spacing; if crosstalk was the cause, its `samples` show the short
+cluster (the first ping, preceded by silence, excepted) and the second does not. `cycle_ms` below 60
+exists only for this comparison — never record a reading taken with it.
 
 #### Sketch of the Pi-side dispatch
 
@@ -786,7 +817,7 @@ at the time of writing) if you want an image comparable to the PlatformIO build.
 
 Open the serial monitor at 9600 baud and reset the board.
 
-1. **Banner** → `{"type":"ready","proto":2,"fw":"2.3.0","role":"puit"}`.
+1. **Banner** → `{"type":"ready","proto":2,"fw":"2.4.0","role":"puit"}`.
 2. `{"id":1,"cmd":"status"}` → `ok` with `fw`/`role`/`uptime_ms` and the limits
    (`max_n:25`, `n_default:10`, `ack_timeout_default_us:50000`, `line_max:192`).
 3. `{"id":2,"cmd":"read_puit"}` → `ok` with a numeric `value` in cm, the four counts summing to `n`,
@@ -839,10 +870,11 @@ Open the serial monitor at 9600 baud and reset the board.
    calibrated to the module currently fitted (~12.3 ms); a replacement clone may differ by an order
    of magnitude in either direction, and getting this wrong reports healthy hardware as dead.
    - `{"id":10,"cmd":"read_puit","n":25}` → read `ack_max_us` and the `ack_us` array. Expect a tight
-     spread; a *scattered* one points at the `delay(3)` ping spacing rather than the module.
+     spread; a *scattered* one means the module is still busy when triggered — raise `cycle_ms`
+     before suspecting the module.
    - If `ack_max_us` has moved, set `DEFAULT_ACK_TIMEOUT_US` to ~4× the new maximum, and record the
      measurement in the commit message the way the current one is recorded in the sketch. Keep it
-     under ~50 ms or the all-dead burst starts to exceed the 1.51 s all-timeout worst case.
+     under ~50 ms so a dead ping still fits inside the 100 ms `cycle_ms` and does not lengthen bursts.
    - Confirm the failure direction is understood: `{"id":11,"cmd":"read_puit","ack_timeout_us":500}`
      on a *working* sensor must produce `sensor_fault` with `n_no_response: n`. **This is the
      firmware calling healthy hardware dead**, reproduced deliberately — the exact bug that shipped
